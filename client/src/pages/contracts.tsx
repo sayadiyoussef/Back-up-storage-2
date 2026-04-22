@@ -7,12 +7,37 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Pencil, Trash2, PlusCircle, RefreshCw, Search } from "lucide-react";
+import { Pencil, Trash2, PlusCircle, RefreshCw, Search, Link2, X } from "lucide-react";
 
 /** ---------- Types basiques (côté UI) ---------- */
 type Market = "LOCAL" | "EXPORT";
 type Client = { id: string; name: string; market: Market; terms?: string; paymentTerms?: string };
 type Product = { id: string; name: string; reference?: string | null };
+type Fixing = {
+  id: string;
+  code?: string;
+  date?: string;
+  grade: string;
+  volume: string;
+  priceUsd?: number;
+  counterparty?: string;
+  vessel?: string;
+};
+
+type ContractRequirement = {
+  id: string;
+  contractId: string;
+  gradeName: string;
+  requiredQty: number;
+};
+
+type ContractAllocation = {
+  id: string;
+  contractId: string;
+  fixingId: string;
+  gradeName: string;
+  allocatedQty: number;
+};
 
 /**
  * Type interne UI (ne reflète pas exactement l'API, on fait le mapping).
@@ -27,11 +52,11 @@ type ContractUI = {
   productName?: string;
   quantityT: number;
   priceCurrency: "USD" | "TND";
-  pricePerT: number; // prix/T dans la devise choisie
-  fxRate: number; // taux de change (optionnel métier)
-  dateStart: string; // YYYY-MM-DD
-  dateEnd: string; // YYYY-MM-DD
-  contractDate: string; // YYYY-MM-DD
+  pricePerT: number;
+  fxRate: number;
+  dateStart: string;
+  dateEnd: string;
+  contractDate: string;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -46,10 +71,19 @@ const fetchJSON = async (url: string, init?: RequestInit) => {
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
-/**
- * Normalise un contrat renvoyé par l’API (nouveau schéma) vers notre shape UI.
- * L’API renvoie : quantityTons, priceUsd/priceTnd, startDate/endDate, contractDate, market…
- */
+const toNum = (v: unknown) => {
+  const n = typeof v === "string" ? Number(v) : (v as number);
+  return Number.isFinite(n) ? Number(n) : 0;
+};
+
+const parseVolumeTons = (v: unknown): number => {
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  const s = String(v ?? "").trim();
+  if (!s) return 0;
+  const cleaned = s.replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+  return cleaned ? Number(cleaned[0]) : 0;
+};
+
 function apiToUI(c: any): ContractUI {
   const quantityT = c.quantityT ?? c.quantityTons ?? 0;
   const dateStart = c.dateStart ?? c.startDate ?? c.contractDate ?? todayStr();
@@ -78,19 +112,15 @@ function apiToUI(c: any): ContractUI {
   };
 }
 
-/**
- * Mappe notre formulaire UI vers le payload attendu par l’API.
- * - quantityT   -> quantityTons
- * - pricePerT   -> priceUsd ou priceTnd selon priceCurrency
- * - dateStart   -> startDate
- * - dateEnd     -> endDate
- */
 function uiToApiPayload(f: ContractUI) {
+  const forcedCurrency: "USD" | "TND" =
+    f.market === "LOCAL" ? "TND" : f.priceCurrency;
+
   const base: any = {
     clientId: f.clientId,
     productId: f.productId,
     quantityTons: Number(f.quantityT) || 0,
-    priceCurrency: f.priceCurrency, // "USD" | "TND"
+    priceCurrency: forcedCurrency,
     fxRate: f.fxRate ? Number(f.fxRate) : undefined,
     contractDate: f.contractDate,
     startDate: f.dateStart,
@@ -98,10 +128,12 @@ function uiToApiPayload(f: ContractUI) {
     market: f.market,
   };
 
-  if (f.priceCurrency === "USD") {
+  if (forcedCurrency === "USD") {
     base.priceUsd = Number(f.pricePerT) || 0;
+    base.priceTnd = undefined;
   } else {
     base.priceTnd = Number(f.pricePerT) || 0;
+    base.priceUsd = undefined;
   }
 
   return base;
@@ -110,7 +142,7 @@ function uiToApiPayload(f: ContractUI) {
 export default function ContractsPage() {
   const qc = useQueryClient();
 
-  /** --------- Data sources: clients & produits --------- */
+  /** --------- Data sources --------- */
   const {
     data: clientsRes,
     isFetching: fetchingClients,
@@ -130,6 +162,16 @@ export default function ContractsPage() {
     queryFn: () => fetchJSON("/api/products"),
   });
   const products: Product[] = useMemo(() => (productsRes as any)?.data ?? [], [productsRes]);
+
+  const {
+    data: fixingsRes,
+    isFetching: fetchingFixings,
+    refetch: refetchFixings,
+  } = useQuery({
+    queryKey: ["/api/fixings"],
+    queryFn: () => fetchJSON("/api/fixings"),
+  });
+  const fixings: Fixing[] = useMemo(() => (fixingsRes as any)?.data ?? [], [fixingsRes]);
 
   /** --------- Contrats --------- */
   const {
@@ -151,11 +193,15 @@ export default function ContractsPage() {
   /** --------- Recherche / Filtre --------- */
   const [q, setQ] = useState("");
   const [marketFilter, setMarketFilter] = useState<Market | "ALL">("ALL");
+  const [clientFilter, setClientFilter] = useState<string>("ALL");
+  const [productFilter, setProductFilter] = useState<string>("ALL");
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
     return rows.filter((r) => {
       if (marketFilter !== "ALL" && r.market !== marketFilter) return false;
+      if (clientFilter !== "ALL" && r.clientId !== clientFilter) return false;
+      if (productFilter !== "ALL" && r.productId !== productFilter) return false;
       if (!needle) return true;
       return (
         (r.code || "").toLowerCase().includes(needle) ||
@@ -163,7 +209,11 @@ export default function ContractsPage() {
         (r.productName || "").toLowerCase().includes(needle)
       );
     });
-  }, [rows, q, marketFilter]);
+  }, [rows, q, marketFilter, clientFilter, productFilter]);
+
+  const totalQuantity = useMemo(() => {
+    return filtered.reduce((sum, r) => sum + (Number(r.quantityT) || 0), 0);
+  }, [filtered]);
 
   /** --------- UI state --------- */
   const [open, setOpen] = useState(false);
@@ -174,7 +224,7 @@ export default function ContractsPage() {
     productId: "",
     market: "LOCAL",
     quantityT: 0,
-    priceCurrency: "USD",
+    priceCurrency: "TND",
     pricePerT: 0,
     fxRate: 3.2,
     dateStart: todayStr(),
@@ -184,6 +234,90 @@ export default function ContractsPage() {
 
   const [form, setForm] = useState<ContractUI>(emptyForm);
   const resetForm = () => setForm(emptyForm);
+
+  /** --------- Allocation UI --------- */
+  const [allocationOpen, setAllocationOpen] = useState(false);
+  const [allocationContract, setAllocationContract] = useState<ContractUI | null>(null);
+  const [draftFixingByGrade, setDraftFixingByGrade] = useState<Record<string, string>>({});
+  const [draftQtyByGrade, setDraftQtyByGrade] = useState<Record<string, string>>({});
+
+  const allocationContractId = allocationContract?.id || "";
+
+  const {
+    data: requirementsRes,
+    refetch: refetchRequirements,
+    isFetching: fetchingRequirements,
+  } = useQuery({
+    queryKey: ["/api/contracts", allocationContractId, "requirements"],
+    queryFn: () => fetchJSON(`/api/contracts/${allocationContractId}/requirements`),
+    enabled: allocationOpen && !!allocationContractId,
+  });
+  const requirements: ContractRequirement[] = useMemo(
+    () => (requirementsRes as any)?.data ?? [],
+    [requirementsRes]
+  );
+
+  const {
+    data: allocationsRes,
+    refetch: refetchAllocations,
+    isFetching: fetchingAllocations,
+  } = useQuery({
+    queryKey: ["/api/contracts", allocationContractId, "allocations"],
+    queryFn: () => fetchJSON(`/api/contracts/${allocationContractId}/allocations`),
+    enabled: allocationOpen && !!allocationContractId,
+  });
+  const allocations: ContractAllocation[] = useMemo(
+    () => (allocationsRes as any)?.data ?? [],
+    [allocationsRes]
+  );
+
+  const {
+    data: coverageRes,
+    refetch: refetchCoverage,
+  } = useQuery({
+    queryKey: ["/api/contracts", allocationContractId, "coverage"],
+    queryFn: () => fetchJSON(`/api/contracts/${allocationContractId}/coverage`),
+    enabled: allocationOpen && !!allocationContractId,
+  });
+  const coverage = Number((coverageRes as any)?.data ?? 0);
+
+  const coverageMapQuery = useQuery({
+    queryKey: ["/api/contracts-coverage-map", rows.map((r) => r.id).join(",")],
+    queryFn: async () => {
+      const entries = await Promise.all(
+        rows
+          .filter((r) => r.id)
+          .map(async (r) => {
+            try {
+              const res = await fetchJSON(`/api/contracts/${r.id}/coverage`);
+              return [r.id!, Number(res?.data ?? 0)] as const;
+            } catch {
+              return [r.id!, 0] as const;
+            }
+          })
+      );
+      return Object.fromEntries(entries);
+    },
+    enabled: rows.length > 0,
+  });
+  const coverageMap = (coverageMapQuery.data ?? {}) as Record<string, number>;
+
+  const allocationsByGrade = useMemo(() => {
+    const m = new Map<string, ContractAllocation[]>();
+    allocations.forEach((a) => {
+      const key = a.gradeName.toLowerCase();
+      if (!m.has(key)) m.set(key, []);
+      m.get(key)!.push(a);
+    });
+    return m;
+  }, [allocations]);
+
+  const openAllocation = (contract: ContractUI) => {
+    setAllocationContract(contract);
+    setAllocationOpen(true);
+    setDraftFixingByGrade({});
+    setDraftQtyByGrade({});
+  };
 
   /** --------- Mutations --------- */
   const saveContract = useMutation({
@@ -201,7 +335,6 @@ export default function ContractsPage() {
     },
     onSuccess: (res: any) => {
       const saved = apiToUI(res?.data);
-      // maj cache (optimiste + refetch safe)
       qc.setQueryData(["/api/contracts"], (prev: any) => {
         const prevArr: ContractUI[] = (prev?.data ?? []).map(apiToUI);
         if (!saved) return prev;
@@ -212,7 +345,6 @@ export default function ContractsPage() {
         return { data: [saved, ...prevArr] };
       });
       qc.invalidateQueries({ queryKey: ["/api/contracts"] });
-      qc.refetchQueries({ queryKey: ["/api/contracts"] });
       setOpen(false);
       setEditingId(null);
       resetForm();
@@ -230,32 +362,118 @@ export default function ContractsPage() {
         return { data: prevArr.filter((c) => c.id !== id) };
       });
       qc.invalidateQueries({ queryKey: ["/api/contracts"] });
-      qc.refetchQueries({ queryKey: ["/api/contracts"] });
     },
     onError: (e: any) => {
       alert(`Erreur suppression contrat:\n${e?.message || e}`);
     },
   });
 
+  const allocateMutation = useMutation({
+    mutationFn: async ({
+      contractId,
+      fixingId,
+      gradeName,
+      qty,
+    }: {
+      contractId: string;
+      fixingId: string;
+      gradeName: string;
+      qty: number;
+    }) =>
+      fetchJSON(`/api/contracts/${contractId}/allocate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fixingId, gradeName, qty }),
+      }),
+    onSuccess: async (_res, vars) => {
+      await Promise.all([
+        refetchAllocations(),
+        refetchRequirements(),
+        refetchCoverage(),
+        refetchFixings(),
+      ]);
+      await coverageMapQuery.refetch();
+      setDraftQtyByGrade((prev) => ({ ...prev, [vars.gradeName]: "" }));
+    },
+    onError: (e: any) => {
+      alert(`Erreur affectation:\n${e?.message || e}`);
+    },
+  });
+
+  const deleteAllocationMutation = useMutation({
+    mutationFn: async (id: string) =>
+      fetchJSON(`/api/allocations/${id}`, { method: "DELETE" }),
+    onSuccess: async () => {
+      await Promise.all([
+        refetchAllocations(),
+        refetchRequirements(),
+        refetchCoverage(),
+        refetchFixings(),
+      ]);
+      await coverageMapQuery.refetch();
+    },
+    onError: (e: any) => {
+      alert(`Erreur suppression affectation:\n${e?.message || e}`);
+    },
+  });
+
   /** --------- Helpers UI --------- */
   const selectedClient = clients.find((c) => c.id === form.clientId) || null;
 
-  // Quand on change de client, caler le marché automatiquement
   const handleClientChange = (id: string) => {
     const c = clients.find((x) => x.id === id);
+    const market = (c?.market as Market) ?? "LOCAL";
+
     setForm((f) => ({
       ...f,
       clientId: id,
-      market: (c?.market as Market) ?? "LOCAL",
+      market,
+      priceCurrency: market === "LOCAL" ? "TND" : "USD",
     }));
   };
 
-  const currencySuffix = form.priceCurrency === "USD" ? "USD/T" : "TND/T";
+  const effectiveCurrency = form.market === "LOCAL" ? "TND" : form.priceCurrency;
+  const currencySuffix = effectiveCurrency === "USD" ? "USD/T" : "TND/T";
+
+  const fixingAvailableMap = useMemo(() => {
+    const usedByFixing = new Map<string, number>();
+    allocations.forEach((a) => {
+      usedByFixing.set(a.fixingId, (usedByFixing.get(a.fixingId) || 0) + Number(a.allocatedQty || 0));
+    });
+
+    const m = new Map<string, number>();
+    fixings.forEach((f) => {
+      const total = parseVolumeTons(f.volume);
+      const usedGlobal = 0;
+      const usedOnThisContract = usedByFixing.get(f.id) || 0;
+      m.set(f.id, Math.max(0, total - usedGlobal));
+      m.set(`${f.id}__plusCurrent`, Math.max(0, total - usedGlobal + usedOnThisContract));
+    });
+    return m;
+  }, [fixings, allocations]);
+
+  const availableFixingsForGrade = (gradeName: string) => {
+    return fixings
+      .filter((f) => String(f.grade || "").trim().toLowerCase() === gradeName.trim().toLowerCase())
+      .map((f) => ({
+        ...f,
+        available: fixingAvailableMap.get(f.id) ?? parseVolumeTons(f.volume),
+      }))
+      .sort((a, b) => (b.available || 0) - (a.available || 0));
+  };
 
   const doRefresh = () => {
     refetchClients();
     refetchProducts();
     refetchContracts();
+    refetchFixings();
+    coverageMapQuery.refetch();
+  };
+
+  const coverageBadge = (v: number) => {
+    if (v >= 0.999) return "bg-emerald-500/15 text-emerald-300 border-emerald-600/40";
+    if (v > 0) return "bg-amber-500/15 text-amber-300 border-amber-600/40";
+    return "bg-red-500/15 text-red-300 border-red-600/40";
   };
 
   return (
@@ -267,7 +485,7 @@ export default function ContractsPage() {
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <h2 className="text-xl font-semibold text-white">Contrats</h2>
-              {(isFetching || fetchingClients || fetchingProducts) && (
+              {(isFetching || fetchingClients || fetchingProducts || fetchingFixings) && (
                 <span className="text-xs text-gray-400">MAJ…</span>
               )}
             </div>
@@ -289,6 +507,30 @@ export default function ContractsPage() {
                 <option value="ALL">Tous marchés</option>
                 <option value="LOCAL">LOCAL</option>
                 <option value="EXPORT">EXPORT</option>
+              </select>
+              <select
+                className="h-9 rounded-md bg-gray-900 border border-gray-700 text-white px-3"
+                value={clientFilter}
+                onChange={(e) => setClientFilter(e.target.value)}
+              >
+                <option value="ALL">Tous clients</option>
+                {clients.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="h-9 rounded-md bg-gray-900 border border-gray-700 text-white px-3"
+                value={productFilter}
+                onChange={(e) => setProductFilter(e.target.value)}
+              >
+                <option value="ALL">Tous produits</option>
+                {products.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
               </select>
               <Button variant="outline" className="border-gray-600 text-white" onClick={doRefresh}>
                 <RefreshCw className="h-4 w-4 mr-2" />
@@ -328,6 +570,7 @@ export default function ContractsPage() {
                         <th className="py-2 px-3">Qté (T)</th>
                         <th className="py-2 px-3">Prix/T</th>
                         <th className="py-2 px-3">FX</th>
+                        <th className="py-2 px-3">Couverture</th>
                         <th className="py-2 px-3">Début</th>
                         <th className="py-2 px-3">Fin</th>
                         <th className="py-2 px-3">Date contrat</th>
@@ -335,66 +578,87 @@ export default function ContractsPage() {
                       </tr>
                     </thead>
                     <tbody className="text-gray-200">
-                      {filtered.map((r) => (
-                        <tr key={r.id} className="border-t border-gray-700">
-                          <td className="py-2 px-3">{r.code || "—"}</td>
-                          <td className="py-2 px-3">
-                            <span
-                              className={`text-xs px-2 py-1 rounded-full border ${
-                                r.market === "LOCAL"
-                                  ? "bg-emerald-500/15 text-emerald-300 border-emerald-600/40"
-                                  : "bg-blue-500/15 text-blue-300 border-blue-600/40"
-                              }`}
-                            >
-                              {r.market}
-                            </span>
-                          </td>
-                          <td className="py-2 px-3">{r.clientName || "—"}</td>
-                          <td className="py-2 px-3">{r.productName || "—"}</td>
-                          <td className="py-2 px-3">{r.quantityT?.toLocaleString() ?? "—"}</td>
-                          <td className="py-2 px-3">
-                            {r.pricePerT?.toLocaleString(undefined, { maximumFractionDigits: 2 })} {r.priceCurrency}/T
-                          </td>
-                          <td className="py-2 px-3">{r.fxRate ?? "—"}</td>
-                          <td className="py-2 px-3">{r.dateStart}</td>
-                          <td className="py-2 px-3">{r.dateEnd}</td>
-                          <td className="py-2 px-3">{r.contractDate}</td>
-                          <td className="py-2 px-3">
-                            <div className="flex items-center gap-2">
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                title="Modifier"
-                                onClick={() => {
-                                  setEditingId(r.id || null);
-                                  setForm({
-                                    ...r,
-                                    clientId: r.clientId,
-                                    productId: r.productId,
-                                    market: r.market,
-                                  } as ContractUI);
-                                  setOpen(true);
-                                }}
+                      {filtered.map((r) => {
+                        const cov = r.id ? Number(coverageMap[r.id] ?? 0) : 0;
+                        return (
+                          <tr key={r.id} className="border-t border-gray-700">
+                            <td className="py-2 px-3">{r.code || "—"}</td>
+                            <td className="py-2 px-3">
+                              <span
+                                className={`text-xs px-2 py-1 rounded-full border ${
+                                  r.market === "LOCAL"
+                                    ? "bg-emerald-500/15 text-emerald-300 border-emerald-600/40"
+                                    : "bg-blue-500/15 text-blue-300 border-blue-600/40"
+                                }`}
                               >
-                                <Pencil className="h-4 w-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                title="Supprimer"
-                                onClick={() => {
-                                  if (!r.id) return;
-                                  if (confirm("Supprimer ce contrat ?")) {
-                                    delContract.mutate(r.id);
-                                  }
-                                }}
-                              >
-                                <Trash2 className="h-4 w-4" />
-                              </Button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
+                                {r.market}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3">{r.clientName || "—"}</td>
+                            <td className="py-2 px-3">{r.productName || "—"}</td>
+                            <td className="py-2 px-3">{r.quantityT?.toLocaleString() ?? "—"}</td>
+                            <td className="py-2 px-3">
+                              {r.pricePerT?.toLocaleString(undefined, { maximumFractionDigits: 2 })} {r.priceCurrency}/T
+                            </td>
+                            <td className="py-2 px-3">{r.fxRate ?? "—"}</td>
+                            <td className="py-2 px-3">
+                              <span className={`text-xs px-2 py-1 rounded-full border ${coverageBadge(cov)}`}>
+                                {(cov * 100).toFixed(0)}%
+                              </span>
+                            </td>
+                            <td className="py-2 px-3">{r.dateStart}</td>
+                            <td className="py-2 px-3">{r.dateEnd}</td>
+                            <td className="py-2 px-3">{r.contractDate}</td>
+                            <td className="py-2 px-3">
+                              <div className="flex items-center gap-2">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  title="Affectations"
+                                  onClick={() => r.id && openAllocation(r)}
+                                >
+                                  <Link2 className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  title="Modifier"
+                                  onClick={() => {
+                                    setEditingId(r.id || null);
+                                    setForm({
+                                      ...r,
+                                      clientId: r.clientId,
+                                      productId: r.productId,
+                                      market: r.market,
+                                    } as ContractUI);
+                                    setOpen(true);
+                                  }}
+                                >
+                                  <Pencil className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  title="Supprimer"
+                                  onClick={() => {
+                                    if (!r.id) return;
+                                    if (confirm("Supprimer ce contrat ?")) {
+                                      delContract.mutate(r.id);
+                                    }
+                                  }}
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      <tr className="border-t border-gray-600 bg-black/20 font-semibold text-white">
+                        <td className="py-2 px-3" colSpan={4}>Total</td>
+                        <td className="py-2 px-3">{totalQuantity.toLocaleString()} T</td>
+                        <td className="py-2 px-3" colSpan={7}></td>
+                      </tr>
                     </tbody>
                   </table>
                 </div>
@@ -413,7 +677,6 @@ export default function ContractsPage() {
             </div>
 
             <div className="grid grid-cols-4 gap-3">
-              {/* Client */}
               <div className="col-span-2">
                 <Label className="text-sm">Client</Label>
                 <select
@@ -435,7 +698,6 @@ export default function ContractsPage() {
                 </select>
               </div>
 
-              {/* Marché */}
               <div>
                 <Label className="text-sm">Marché</Label>
                 <select
@@ -448,7 +710,6 @@ export default function ContractsPage() {
                 </select>
               </div>
 
-              {/* Date contrat */}
               <div>
                 <Label className="text-sm">Date contrat</Label>
                 <Input
@@ -459,7 +720,6 @@ export default function ContractsPage() {
                 />
               </div>
 
-              {/* Produit */}
               <div className="col-span-2">
                 <Label className="text-sm">Produit</Label>
                 <select
@@ -476,7 +736,6 @@ export default function ContractsPage() {
                 </select>
               </div>
 
-              {/* Qté */}
               <div>
                 <Label className="text-sm">Quantité (T)</Label>
                 <Input
@@ -487,12 +746,12 @@ export default function ContractsPage() {
                 />
               </div>
 
-              {/* Devise prix */}
               <div>
                 <Label className="text-sm">Devise</Label>
                 <select
                   className="w-full h-9 rounded-md bg-black/40 border border-gray-700 text-white px-3"
-                  value={form.priceCurrency}
+                  value={effectiveCurrency}
+                  disabled={form.market === "LOCAL"}
                   onChange={(e) => setForm({ ...form, priceCurrency: e.target.value as "USD" | "TND" })}
                 >
                   <option value="USD">USD</option>
@@ -500,7 +759,6 @@ export default function ContractsPage() {
                 </select>
               </div>
 
-              {/* Prix par tonne */}
               <div>
                 <Label className="text-sm">Prix ({currencySuffix})</Label>
                 <Input
@@ -511,7 +769,6 @@ export default function ContractsPage() {
                 />
               </div>
 
-              {/* FX */}
               <div>
                 <Label className="text-sm">Taux de change</Label>
                 <Input
@@ -522,7 +779,6 @@ export default function ContractsPage() {
                 />
               </div>
 
-              {/* Début / Fin */}
               <div>
                 <Label className="text-sm">Date début</Label>
                 <Input
@@ -561,6 +817,188 @@ export default function ContractsPage() {
                 }}
               >
                 Enregistrer
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Affectations */}
+      {allocationOpen && allocationContract && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-lg p-4 w-[1100px] max-h-[90vh] overflow-y-auto">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <div className="text-lg font-semibold">Affectation des fixings</div>
+                <div className="text-sm text-gray-400">
+                  {allocationContract.code || "—"} · {allocationContract.clientName || "—"} · {allocationContract.productName || "—"} · {allocationContract.quantityT.toLocaleString()} T
+                </div>
+              </div>
+              <Button variant="ghost" size="icon" onClick={() => setAllocationOpen(false)}>
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+
+            <div className="mb-4 flex items-center gap-3">
+              <span className={`text-xs px-2 py-1 rounded-full border ${coverageBadge(coverage)}`}>
+                Couverture {(coverage * 100).toFixed(1)}%
+              </span>
+              {(fetchingRequirements || fetchingAllocations) && (
+                <span className="text-xs text-gray-400">Mise à jour…</span>
+              )}
+            </div>
+
+            <div className="space-y-4">
+              {requirements.length === 0 ? (
+                <div className="text-gray-300">Aucun besoin calculé pour ce contrat.</div>
+              ) : (
+                requirements.map((req) => {
+                  const gradeKey = req.gradeName.toLowerCase();
+                  const gradeAllocs = allocationsByGrade.get(gradeKey) || [];
+                  const allocated = gradeAllocs.reduce((s, a) => s + Number(a.allocatedQty || 0), 0);
+                  const remaining = Math.max(0, req.requiredQty - allocated);
+                  const candidates = availableFixingsForGrade(req.gradeName);
+                  const selectedFixingId = draftFixingByGrade[req.gradeName] || "";
+                  const selectedFixing = candidates.find((f) => f.id === selectedFixingId);
+
+                  return (
+                    <Card key={req.id} className="bg-black/20 border-gray-700">
+                      <CardContent className="p-4">
+                        <div className="flex items-center justify-between mb-3">
+                          <div>
+                            <div className="font-semibold">{req.gradeName}</div>
+                            <div className="text-sm text-gray-400">
+                              Besoin: {req.requiredQty.toLocaleString(undefined, { maximumFractionDigits: 3 })} T ·
+                              Affecté: {allocated.toLocaleString(undefined, { maximumFractionDigits: 3 })} T ·
+                              Reste: {remaining.toLocaleString(undefined, { maximumFractionDigits: 3 })} T
+                            </div>
+                          </div>
+                          <span className={`text-xs px-2 py-1 rounded-full border ${coverageBadge(req.requiredQty > 0 ? allocated / req.requiredQty : 0)}`}>
+                            {req.requiredQty > 0 ? ((allocated / req.requiredQty) * 100).toFixed(0) : "0"}%
+                          </span>
+                        </div>
+
+                        {gradeAllocs.length > 0 && (
+                          <div className="mb-4 overflow-x-auto">
+                            <table className="min-w-full text-sm">
+                              <thead className="text-gray-400">
+                                <tr className="text-left">
+                                  <th className="py-2 pr-3">Fixing</th>
+                                  <th className="py-2 pr-3">Date</th>
+                                  <th className="py-2 pr-3">Vessel</th>
+                                  <th className="py-2 pr-3">Qté affectée</th>
+                                  <th className="py-2 pr-3">Actions</th>
+                                </tr>
+                              </thead>
+                              <tbody className="text-gray-200">
+                                {gradeAllocs.map((a) => {
+                                  const fx = fixings.find((f) => f.id === a.fixingId);
+                                  return (
+                                    <tr key={a.id} className="border-t border-gray-800">
+                                      <td className="py-2 pr-3">{fx?.code || a.fixingId}</td>
+                                      <td className="py-2 pr-3">{fx?.date || "—"}</td>
+                                      <td className="py-2 pr-3">{fx?.vessel || "—"}</td>
+                                      <td className="py-2 pr-3">
+                                        {Number(a.allocatedQty).toLocaleString(undefined, { maximumFractionDigits: 3 })} T
+                                      </td>
+                                      <td className="py-2 pr-3">
+                                        <Button
+                                          variant="ghost"
+                                          size="icon"
+                                          title="Supprimer affectation"
+                                          onClick={() => {
+                                            if (confirm("Supprimer cette affectation ?")) {
+                                              deleteAllocationMutation.mutate(a.id);
+                                            }
+                                          }}
+                                        >
+                                          <Trash2 className="h-4 w-4" />
+                                        </Button>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-12 gap-3 items-end">
+                          <div className="col-span-6">
+                            <Label className="text-sm">Fixing disponible</Label>
+                            <select
+                              className="w-full h-9 rounded-md bg-black/40 border border-gray-700 text-white px-3"
+                              value={selectedFixingId}
+                              onChange={(e) =>
+                                setDraftFixingByGrade((prev) => ({
+                                  ...prev,
+                                  [req.gradeName]: e.target.value,
+                                }))
+                              }
+                            >
+                              <option value="">Sélectionner…</option>
+                              {candidates.map((f) => (
+                                <option key={f.id} value={f.id}>
+                                  {(f.code || f.id)} · dispo {Number(f.available || 0).toLocaleString(undefined, { maximumFractionDigits: 3 })} T
+                                  {f.vessel ? ` · ${f.vessel}` : ""}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div className="col-span-3">
+                            <Label className="text-sm">Quantité à affecter</Label>
+                            <Input
+                              inputMode="decimal"
+                              className="bg-black/40 border-gray-700 text-white"
+                              value={draftQtyByGrade[req.gradeName] ?? ""}
+                              onChange={(e) =>
+                                setDraftQtyByGrade((prev) => ({
+                                  ...prev,
+                                  [req.gradeName]: e.target.value,
+                                }))
+                              }
+                            />
+                          </div>
+
+                          <div className="col-span-3">
+                            <Button
+                              className="w-full bg-trading-blue"
+                              disabled={!selectedFixingId || remaining <= 0 || allocateMutation.isPending}
+                              onClick={() => {
+                                const qty = Number(draftQtyByGrade[req.gradeName] || 0);
+                                if (!selectedFixingId) return alert("Choisis un fixing.");
+                                if (!Number.isFinite(qty) || qty <= 0) return alert("Saisis une quantité valide.");
+                                allocateMutation.mutate({
+                                  contractId: allocationContract.id!,
+                                  fixingId: selectedFixingId,
+                                  gradeName: req.gradeName,
+                                  qty,
+                                });
+                              }}
+                            >
+                              Affecter
+                            </Button>
+                          </div>
+                        </div>
+
+                        {selectedFixing && (
+                          <div className="mt-2 text-xs text-gray-400">
+                            Disponible sur fixing: {Number(selectedFixing.available || 0).toLocaleString(undefined, { maximumFractionDigits: 3 })} T
+                            {selectedFixing.counterparty ? ` · ${selectedFixing.counterparty}` : ""}
+                            {selectedFixing.vessel ? ` · ${selectedFixing.vessel}` : ""}
+                          </div>
+                        )}
+                      </CardContent>
+                    </Card>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 mt-4">
+              <Button variant="outline" onClick={() => setAllocationOpen(false)}>
+                Fermer
               </Button>
             </div>
           </div>

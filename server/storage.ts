@@ -26,6 +26,23 @@ type Product = {
 };
 // ------------------------------------------------
 
+// --------- Affectations contrats / fixings -----------
+type ContractRequirement = {
+  id: string;
+  contractId: string;
+  gradeName: string;
+  requiredQty: number;
+};
+
+type ContractFixingAllocation = {
+  id: string;
+  contractId: string;
+  fixingId: string;
+  gradeName: string;
+  allocatedQty: number;
+};
+// ------------------------------------------------
+
 /** Données forwards intégrées (indexées par nom de grade) */
 const FORWARDS: Record<string, ForwardPoint[]> = {
   "RBD PO": [
@@ -162,6 +179,22 @@ export interface IStorage {
     data: Partial<Omit<Contract, "id" | "createdAt" | "updatedAt">>
   ): Promise<Contract>;
   deleteContract(id: string): Promise<void>;
+
+  // Affectations contrats / fixings
+  getContractRequirements(contractId: string): Promise<ContractRequirement[]>;
+  getContractAllocations(contractId: string): Promise<ContractFixingAllocation[]>;
+  getFixingAvailableQty(fixingId: string): Promise<number>;
+  allocateFixing(data: {
+    contractId: string;
+    fixingId: string;
+    gradeName: string;
+    qty: number;
+  }): Promise<ContractFixingAllocation>;
+  deleteAllocation(id: string): Promise<void>;
+  getContractCoverage(contractId: string): Promise<number>;
+  getGradeAllocationSummary(): Promise<
+    Array<{ gradeName: string; fixedQty: number; allocatedQty: number; unallocatedQty: number }>
+  >;
 }
 
 class MemStorage implements IStorage {
@@ -230,7 +263,6 @@ class MemStorage implements IStorage {
     return def;
   }
   private parseVolumeMT(v: any) {
-    // Accepte "5,000 MT", "5000", 5000…
     return this.parseNumberLoose(v, 0);
   }
   private getVesselByName(name?: string | null): Vessel | undefined {
@@ -262,37 +294,37 @@ class MemStorage implements IStorage {
     vesselName?: string | null;
     grade?: string | null;
     volume?: any;
-    excludeFixingId?: string; // pour update
+    excludeFixingId?: string;
   }) {
     const v = this.getVesselByName(params.vesselName ?? "");
-    if (!v) return; // pas de plan => on n’impose rien
+    if (!v) return;
 
     const plannedTotal = this.parseNumberLoose(v.quantityTotal, 0);
     const allocations = (v.gradeAllocations ?? []).map(a => ({ ...a, gradeName: String(a.gradeName).trim() }));
-
-    // aucun plan défini => on ne bloque pas
     if (!plannedTotal && allocations.length === 0) return;
 
     const newQty = this.parseVolumeMT(params.volume);
     const gradeName = String(params.grade || "").trim();
-
     const { byGrade, total } = this.computeVesselConsumption(v.name, params.excludeFixingId);
 
-    // contrôle total
-    if (plannedTotal > 0 && total + newQty > plannedTotal + 1e-9) {
-      const remain = Math.max(0, plannedTotal - total);
-      const err: any = new Error(
-        `Plan capacity exceeded for vessel "${v.name}": total ${total + newQty} MT > planned ${plannedTotal} MT (remaining ${remain} MT).`
-      );
-      err.status = 409;
-      throw err;
+    // tolère les données seedées déjà hors-plan: on bloque seulement si on aggrave au-delà
+    if (plannedTotal > 0) {
+      const currentOverflow = Math.max(0, total - plannedTotal);
+      if (total + newQty > plannedTotal + 1e-9 && currentOverflow <= 1e-9) {
+        const remain = Math.max(0, plannedTotal - total);
+        const err: any = new Error(
+          `Plan capacity exceeded for vessel "${v.name}": total ${total + newQty} MT > planned ${plannedTotal} MT (remaining ${remain} MT).`
+        );
+        err.status = 409;
+        throw err;
+      }
     }
 
-    // contrôle par grade (si défini)
     const planForGrade = allocations.find(a => a.gradeName.toLowerCase() === gradeName.toLowerCase());
     if (planForGrade) {
       const used = byGrade.get(gradeName) || 0;
-      if (used + newQty > planForGrade.qty + 1e-9) {
+      const currentOverflow = Math.max(0, used - planForGrade.qty);
+      if (used + newQty > planForGrade.qty + 1e-9 && currentOverflow <= 1e-9) {
         const remain = Math.max(0, planForGrade.qty - used);
         const err: any = new Error(
           `Grade plan exceeded on "${v.name}" for ${gradeName}: ${used + newQty} MT > planned ${planForGrade.qty} MT (remaining ${remain} MT).`
@@ -306,6 +338,56 @@ class MemStorage implements IStorage {
       err.status = 409;
       throw err;
     }
+  }
+
+  private normalizeFixingPayload(data: any, existing?: any) {
+    const normalized = {
+      ...(existing || {}),
+      ...data,
+    };
+
+    normalized.date = String(normalized.date || existing?.date || new Date().toISOString().slice(0, 10));
+    normalized.route = String(normalized.route || existing?.route || "N/A");
+    normalized.grade = String(normalized.grade || existing?.grade || "");
+    normalized.volume = String(normalized.volume || existing?.volume || "");
+    normalized.priceUsd =
+      normalized.priceUsd === "" || normalized.priceUsd == null
+        ? undefined
+        : Number(normalized.priceUsd);
+    normalized.counterparty = String(normalized.counterparty || existing?.counterparty || "");
+    normalized.vessel = normalized.vessel ? String(normalized.vessel) : undefined;
+    normalized.freightUsd =
+      normalized.freightUsd === "" || normalized.freightUsd == null
+        ? undefined
+        : Number(normalized.freightUsd);
+
+    if (!normalized.grade) {
+      const err: any = new Error("Missing grade");
+      err.status = 400;
+      throw err;
+    }
+    if (!normalized.date) {
+      const err: any = new Error("Missing date");
+      err.status = 400;
+      throw err;
+    }
+    if (!normalized.volume || this.parseVolumeMT(normalized.volume) <= 0) {
+      const err: any = new Error("Volume must be greater than 0");
+      err.status = 400;
+      throw err;
+    }
+    if (normalized.priceUsd == null || !Number.isFinite(normalized.priceUsd)) {
+      const err: any = new Error("Invalid FOB price");
+      err.status = 400;
+      throw err;
+    }
+    if (!normalized.counterparty) {
+      const err: any = new Error("Missing counterparty");
+      err.status = 400;
+      throw err;
+    }
+
+    return normalized;
   }
 
   /** Génère un code contrat du type LOCAL2025001 / EXPORT2025002 */
@@ -327,7 +409,7 @@ class MemStorage implements IStorage {
       .map((t) => {
         const clean = t.replace(/[^A-Za-z0-9]/g, "");
         if (!clean) return "";
-        if (/^[A-Z0-9]+$/.test(clean) && clean.length > 1 && clean === clean.toUpperCase()) return clean; // acronyme déjà propre
+        if (/^[A-Z0-9]+$/.test(clean) && clean.length > 1 && clean === clean.toUpperCase()) return clean;
         return clean[0].toUpperCase();
       })
       .filter(Boolean);
@@ -360,6 +442,34 @@ class MemStorage implements IStorage {
       code = `${acronym}${year}${String(seq).padStart(5, "0")}`;
     }
     return code;
+  }
+
+  // ---- Affectations contrats/fixings ----
+  private async computeContractRequirements(contract: Contract): Promise<ContractRequirement[]> {
+    const product = this.products.get(contract.productId);
+    if (!product) return [];
+
+    const qty = Number(contract.quantityTons) || 0;
+
+    return (product.composition || [])
+      .map((c) => ({
+        id: randomUUID(),
+        contractId: contract.id,
+        gradeName: String(c.gradeName || "").trim(),
+        requiredQty: Math.round((((qty * Number(c.percent || 0)) / 100) + Number.EPSILON) * 1000) / 1000,
+      }))
+      .filter((r) => r.gradeName && r.requiredQty > 0);
+  }
+
+  private replaceContractRequirements(contractId: string, rows: ContractRequirement[]) {
+    this.db.prepare(`DELETE FROM contract_requirements WHERE contract_id = ?`).run(contractId);
+    const stmt = this.db.prepare(`
+      INSERT INTO contract_requirements (id, contract_id, grade_name, required_qty)
+      VALUES (?, ?, ?, ?)
+    `);
+    for (const r of rows) {
+      stmt.run(r.id, r.contractId, r.gradeName, r.requiredQty);
+    }
   }
 
   private initSqlite() {
@@ -401,6 +511,19 @@ class MemStorage implements IStorage {
         notes TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS contract_requirements (
+        id TEXT PRIMARY KEY,
+        contract_id TEXT NOT NULL,
+        grade_name TEXT NOT NULL,
+        required_qty REAL NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS contract_fixing_allocations (
+        id TEXT PRIMARY KEY,
+        contract_id TEXT NOT NULL,
+        fixing_id TEXT NOT NULL,
+        grade_name TEXT NOT NULL,
+        allocated_qty REAL NOT NULL
       );
     `);
   }
@@ -572,14 +695,14 @@ class MemStorage implements IStorage {
     // Vessels avec nouveaux champs (rétro-compat OK si non utilisés)
     [
       { name: "June shipment 25",    type: "Tanker", dwt: 45000, status: "Laden",    eta: "2025-09-02", origin: "Port Klang",  destination: "Rades",
-        tender: "Tender 2025", supplier: "Wilmar", quantityTotal: 4000,
+        tender: "Tender 2025", supplier: "Wilmar", quantityTotal: 5000,
         gradeAllocations: [
-          { gradeName: "RBD PO", qty: 2000 }, { gradeName: "RBD POL IV56", qty: 1000 }, { gradeName: "RBD CNO", qty: 500 }, { gradeName: "RBD PKO", qty: 500 }
+          { gradeName: "RBD PO", qty: 5000 }
         ] },
       { name: "August shipment 25",  type: "Tanker", dwt: 38000, status: "Ballast",  eta: "2025-08-28", origin: "Belawan",     destination: "Rades",
         tender: "Tender 2025", supplier: "Musim Mas", quantityTotal: 3000,
         gradeAllocations: [
-          { gradeName: "RBD PO", qty: 1500 }, { gradeName: "RBD PKO", qty: 1500 }
+          { gradeName: "RBD PKO", qty: 3000 }
         ] },
       { name: "January shipment 26", type: "Tanker", dwt: 52000, status: "At anchor", eta: "2025-09-10", origin: "New Orleans", destination: "Rades",
         tender: "Tender 2026", supplier: "Bunge", quantityTotal: 8000,
@@ -880,30 +1003,31 @@ class MemStorage implements IStorage {
   }
 
   async createFixing(data: any) {
-    // vérifie le plan avant enregistrement
+    const normalized = this.normalizeFixingPayload(data);
+
     this.assertFixingFitsVesselPlan({
-      vesselName: data.vessel,
-      grade: data.grade,
-      volume: data.volume,
+      vesselName: normalized.vessel,
+      grade: normalized.grade,
+      volume: normalized.volume,
     });
 
     const id = randomUUID();
     const code =
-      data.code && String(data.code).trim().length
-        ? String(data.code).trim()
-        : this.buildFixingCode(data.grade, data.date);
+      normalized.code && String(normalized.code).trim().length
+        ? String(normalized.code).trim()
+        : this.buildFixingCode(normalized.grade, normalized.date);
 
     const f = {
       id,
-      date: data.date,
-      route: data.route,
-      grade: data.grade,
-      volume: data.volume,
-      priceUsd: Number(data.priceUsd),
-      counterparty: data.counterparty,
-      vessel: data.vessel || undefined,
-      freightUsd: data.freightUsd != null ? Number(data.freightUsd) : undefined,
-      notes: data.notes,
+      date: normalized.date,
+      route: normalized.route,
+      grade: normalized.grade,
+      volume: normalized.volume,
+      priceUsd: normalized.priceUsd,
+      counterparty: normalized.counterparty,
+      vessel: normalized.vessel || undefined,
+      freightUsd: normalized.freightUsd,
+      notes: normalized.notes,
       code, // ✅ nouveau
     };
 
@@ -918,12 +1042,16 @@ class MemStorage implements IStorage {
 
   async updateFixing(id: string, data: any) {
     const existing = this.fixings.get(id);
-    if (!existing) throw new Error("Fixing not found");
+    if (!existing) {
+      const err: any = new Error("Fixing not found");
+      err.status = 404;
+      throw err;
+    }
 
-    // ne pas écraser le code si non fourni
-    const next = { ...existing, ...data, id, code: data.code ?? existing.code };
+    const next = this.normalizeFixingPayload(data, existing);
+    next.id = id;
+    next.code = data.code ?? existing.code;
 
-    // re-contrôle avec exclusion de l’ID courant
     this.assertFixingFitsVesselPlan({
       vesselName: next.vessel,
       grade: next.grade,
@@ -939,6 +1067,7 @@ class MemStorage implements IStorage {
     return next;
   }
   async deleteFixing(id: string) {
+    this.db.prepare(`DELETE FROM contract_fixing_allocations WHERE fixing_id = ?`).run(id);
     this.fixings.delete(id);
   }
 
@@ -1141,6 +1270,14 @@ class MemStorage implements IStorage {
       if (p) productName = p.name;
     }
 
+    const normalizedPriceCurrency: "USD" | "TND" = market === "LOCAL" ? "TND" : "USD";
+    const normalizedPriceUsd = normalizedPriceCurrency === "USD" && data.priceUsd !== undefined
+      ? Number(data.priceUsd)
+      : undefined;
+    const normalizedPriceTnd = normalizedPriceCurrency === "TND" && data.priceTnd !== undefined
+      ? Number(data.priceTnd)
+      : undefined;
+
     const c: Contract = {
       id,
       code,
@@ -1151,9 +1288,9 @@ class MemStorage implements IStorage {
       productId: data.productId,
       productName: productName || "—",
       quantityTons: Number(data.quantityTons),
-      priceCurrency: data.priceCurrency,
-      priceUsd: data.priceUsd !== undefined ? Number(data.priceUsd) : undefined,
-      priceTnd: data.priceTnd !== undefined ? Number(data.priceTnd) : undefined,
+      priceCurrency: normalizedPriceCurrency,
+      priceUsd: normalizedPriceUsd,
+      priceTnd: normalizedPriceTnd,
       fxRate: data.fxRate !== undefined ? Number(data.fxRate) : undefined,
       startDate: data.startDate,
       endDate: data.endDate,
@@ -1175,6 +1312,10 @@ class MemStorage implements IStorage {
     );
 
     this.contracts.set(id, c);
+
+    const requirements = await this.computeContractRequirements(c);
+    this.replaceContractRequirements(c.id, requirements);
+
     return c;
   }
 
@@ -1202,6 +1343,7 @@ class MemStorage implements IStorage {
       nextCode = data.code;
     }
 
+    const normalizedPriceCurrency: "USD" | "TND" = nextMarket === "LOCAL" ? "TND" : "USD";
     const next: Contract = {
       ...existing,
       ...data,
@@ -1209,8 +1351,15 @@ class MemStorage implements IStorage {
       contractDate: nextDate,
       market: nextMarket,
       quantityTons: data.quantityTons !== undefined ? Number(data.quantityTons) : existing.quantityTons,
-      priceUsd: data.priceUsd !== undefined ? Number(data.priceUsd) : existing.priceUsd,
-      priceTnd: data.priceTnd !== undefined ? Number(data.priceTnd) : existing.priceTnd,
+      priceCurrency: normalizedPriceCurrency,
+      priceUsd:
+        normalizedPriceCurrency === "USD"
+          ? (data.priceUsd !== undefined ? Number(data.priceUsd) : existing.priceUsd)
+          : undefined,
+      priceTnd:
+        normalizedPriceCurrency === "TND"
+          ? (data.priceTnd !== undefined ? Number(data.priceTnd) : existing.priceTnd)
+          : undefined,
       fxRate: data.fxRate !== undefined ? Number(data.fxRate) : existing.fxRate,
       updatedAt: new Date().toISOString(),
     };
@@ -1228,12 +1377,284 @@ class MemStorage implements IStorage {
     );
 
     this.contracts.set(id, next);
+
+    const requirements = await this.computeContractRequirements(next);
+    this.replaceContractRequirements(id, requirements);
+
     return next;
   }
 
   async deleteContract(id: string) {
+    this.db.prepare(`DELETE FROM contract_fixing_allocations WHERE contract_id = ?`).run(id);
+    this.db.prepare(`DELETE FROM contract_requirements WHERE contract_id = ?`).run(id);
     this.db.prepare(`DELETE FROM contracts WHERE id = ?`).run(id);
     this.contracts.delete(id);
+  }
+
+  // ------------------- Affectations contrats / fixings -------------------
+  async getContractRequirements(contractId: string): Promise<ContractRequirement[]> {
+  this.loadSqliteToMaps();
+
+  let rows = this.db.prepare(`
+    SELECT id, contract_id, grade_name, required_qty
+    FROM contract_requirements
+    WHERE contract_id = ?
+    ORDER BY grade_name
+  `).all(contractId) as any[];
+
+  if (!rows.length) {
+    const contract = this.contracts.get(contractId);
+    if (contract) {
+      const computed = await this.computeContractRequirements(contract);
+      if (computed.length) {
+        this.replaceContractRequirements(contractId, computed);
+        rows = this.db.prepare(`
+          SELECT id, contract_id, grade_name, required_qty
+          FROM contract_requirements
+          WHERE contract_id = ?
+          ORDER BY grade_name
+        `).all(contractId) as any[];
+      }
+    }
+  }
+    return rows.map((r) => ({
+      id: r.id,
+      contractId: r.contract_id,
+      gradeName: r.grade_name,
+      requiredQty: Number(r.required_qty),
+    }));
+  }
+
+  async getContractAllocations(contractId: string): Promise<ContractFixingAllocation[]> {
+    const rows = this.db.prepare(`
+      SELECT id, contract_id, fixing_id, grade_name, allocated_qty
+      FROM contract_fixing_allocations
+      WHERE contract_id = ?
+      ORDER BY grade_name, id
+    `).all(contractId) as any[];
+
+    return rows.map((r) => ({
+      id: r.id,
+      contractId: r.contract_id,
+      fixingId: r.fixing_id,
+      gradeName: r.grade_name,
+      allocatedQty: Number(r.allocated_qty),
+    }));
+  }
+
+  async getFixingAvailableQty(fixingId: string): Promise<number> {
+    const fixing = this.fixings.get(fixingId);
+    if (!fixing) return 0;
+
+    const row = this.db.prepare(`
+      SELECT SUM(allocated_qty) as used
+      FROM contract_fixing_allocations
+      WHERE fixing_id = ?
+    `).get(fixingId) as any;
+
+    const used = Number(row?.used || 0);
+    const total = this.parseVolumeMT(fixing.volume);
+
+    return Math.max(0, total - used);
+  }
+
+async getContractRequirements(contractId: string): Promise<ContractRequirement[]> {
+  this.loadSqliteToMaps();
+
+  let rows = this.db.prepare(`
+    SELECT id, contract_id, grade_name, required_qty
+    FROM contract_requirements
+    WHERE contract_id = ?
+    ORDER BY grade_name
+  `).all(contractId) as any[];
+
+  if (!rows.length) {
+    const contract = this.contracts.get(contractId);
+    if (contract) {
+      const computed = await this.computeContractRequirements(contract);
+      if (computed.length) {
+        this.replaceContractRequirements(contractId, computed);
+        rows = this.db.prepare(`
+          SELECT id, contract_id, grade_name, required_qty
+          FROM contract_requirements
+          WHERE contract_id = ?
+          ORDER BY grade_name
+        `).all(contractId) as any[];
+      }
+    }
+  }
+
+  return rows.map((r) => ({
+    id: r.id,
+    contractId: r.contract_id,
+    gradeName: r.grade_name,
+    requiredQty: Number(r.required_qty),
+  }));
+}
+
+async allocateFixing(data: {
+  contractId: string;
+  fixingId: string;
+  gradeName: string;
+  qty: number;
+}): Promise<ContractFixingAllocation> {
+  this.loadSqliteToMaps();
+
+  const contract = this.contracts.get(data.contractId);
+  if (!contract) {
+    const err: any = new Error("Contract not found");
+    err.status = 404;
+    throw err;
+  }
+
+  const fixing = this.fixings.get(data.fixingId);
+  if (!fixing) {
+    const err: any = new Error("Fixing not found");
+    err.status = 404;
+    throw err;
+  }
+
+  const qty = Number(data.qty);
+  if (!Number.isFinite(qty) || qty <= 0) {
+    const err: any = new Error("Allocation qty must be > 0");
+    err.status = 400;
+    throw err;
+  }
+
+  const fixingGrade = String(fixing.grade || "").trim();
+  const wantedGrade = String(data.gradeName || "").trim();
+  if (fixingGrade.toLowerCase() !== wantedGrade.toLowerCase()) {
+    const err: any = new Error(`Fixing grade mismatch. Expected ${wantedGrade}, got ${fixingGrade}`);
+    err.status = 400;
+    throw err;
+  }
+
+  const requirements = await this.getContractRequirements(data.contractId);
+  const req = requirements.find((r) => r.gradeName.toLowerCase() === wantedGrade.toLowerCase());
+  if (!req) {
+    const err: any = new Error(`No requirement found for grade ${wantedGrade}`);
+    err.status = 400;
+    throw err;
+  }
+
+  const allocations = await this.getContractAllocations(data.contractId);
+  const sameGradeAllocs = allocations.filter((a) => a.gradeName.toLowerCase() === wantedGrade.toLowerCase());
+  const existingForSameFixing = sameGradeAllocs.find((a) => a.fixingId === data.fixingId);
+
+  const distinctFixings = new Set(sameGradeAllocs.map((a) => a.fixingId));
+  if (!existingForSameFixing && distinctFixings.size >= 3) {
+    const err: any = new Error(`Maximum 3 fixings allowed for grade ${wantedGrade}`);
+    err.status = 400;
+    throw err;
+  }
+
+  const alreadyAllocatedForGrade = sameGradeAllocs.reduce((s, a) => s + Number(a.allocatedQty || 0), 0);
+  if (alreadyAllocatedForGrade + qty > req.requiredQty + 1e-9) {
+    const remain = Math.max(0, req.requiredQty - alreadyAllocatedForGrade);
+    const err: any = new Error(`Required quantity exceeded for ${wantedGrade}. Remaining to cover: ${remain} MT.`);
+    err.status = 409;
+    throw err;
+  }
+
+  const available = await this.getFixingAvailableQty(data.fixingId);
+  if (qty > available + 1e-9) {
+    const err: any = new Error(`Not enough quantity available in fixing. Available: ${available} MT.`);
+    err.status = 409;
+    throw err;
+  }
+
+  if (existingForSameFixing) {
+    const newQty = existingForSameFixing.allocatedQty + qty;
+    this.db.prepare(`
+      UPDATE contract_fixing_allocations
+      SET allocated_qty = ?
+      WHERE id = ?
+    `).run(newQty, existingForSameFixing.id);
+
+    return {
+      ...existingForSameFixing,
+      allocatedQty: newQty,
+    };
+  }
+
+  const id = randomUUID();
+  this.db.prepare(`
+    INSERT INTO contract_fixing_allocations
+    (id, contract_id, fixing_id, grade_name, allocated_qty)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, data.contractId, data.fixingId, wantedGrade, qty);
+
+  return {
+    id,
+    contractId: data.contractId,
+    fixingId: data.fixingId,
+    gradeName: wantedGrade,
+    allocatedQty: qty,
+  };
+}
+
+  async deleteAllocation(id: string): Promise<void> {
+    this.db.prepare(`DELETE FROM contract_fixing_allocations WHERE id = ?`).run(id);
+  }
+
+  async getContractCoverage(contractId: string): Promise<number> {
+    const reqs = await this.getContractRequirements(contractId);
+    const allocs = await this.getContractAllocations(contractId);
+
+    const map = new Map<string, number>();
+    allocs.forEach((a) => {
+      const key = a.gradeName.toLowerCase();
+      map.set(key, (map.get(key) || 0) + a.allocatedQty);
+    });
+
+    let totalRequired = 0;
+    let totalCovered = 0;
+
+    for (const r of reqs) {
+      totalRequired += r.requiredQty;
+      totalCovered += Math.min(r.requiredQty, map.get(r.gradeName.toLowerCase()) || 0);
+    }
+
+    if (totalRequired <= 0) return 0;
+    return totalCovered / totalRequired;
+  }
+
+  async getGradeAllocationSummary(): Promise<Array<{ gradeName: string; fixedQty: number; allocatedQty: number; unallocatedQty: number }>> {
+    const fixedByGrade = new Map<string, number>();
+    for (const f of this.fixings.values()) {
+      const grade = String(f.grade || "").trim();
+      if (!grade) continue;
+      fixedByGrade.set(grade, (fixedByGrade.get(grade) || 0) + this.parseVolumeMT(f.volume));
+    }
+
+    const allocRows = this.db.prepare(`
+      SELECT grade_name, SUM(allocated_qty) as allocated
+      FROM contract_fixing_allocations
+      GROUP BY grade_name
+    `).all() as any[];
+
+    const allocatedByGrade = new Map<string, number>();
+    for (const r of allocRows) {
+      allocatedByGrade.set(String(r.grade_name), Number(r.allocated || 0));
+    }
+
+    const grades = new Set<string>([
+      ...Array.from(fixedByGrade.keys()),
+      ...Array.from(allocatedByGrade.keys()),
+    ]);
+
+    return Array.from(grades)
+      .sort((a, b) => a.localeCompare(b))
+      .map((gradeName) => {
+        const fixedQty = fixedByGrade.get(gradeName) || 0;
+        const allocatedQty = allocatedByGrade.get(gradeName) || 0;
+        return {
+          gradeName,
+          fixedQty,
+          allocatedQty,
+          unallocatedQty: fixedQty - allocatedQty,
+        };
+      });
   }
 }
 

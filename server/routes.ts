@@ -243,7 +243,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   /* --------------- Fixings --------------- */
-  // --- Helpers pour code itératif ---
   function makeGradeAcronym(name: string): string {
     if (!name) return "FIX";
     const tokens = String(name).split(/[\s\-_/]+/).filter(Boolean);
@@ -251,9 +250,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       .map((t) => {
         const clean = t.replace(/[^A-Za-z0-9]/g, "");
         if (!clean) return "";
-        // si tout en majuscules (acronyme) => garder tel quel
         if (/^[A-Z0-9]+$/.test(clean) && clean === clean.toUpperCase() && clean.length > 1) return clean;
-        // sinon première lettre en majuscule
         return clean[0].toUpperCase();
       })
       .filter(Boolean);
@@ -276,11 +273,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         if (Number.isFinite(n) && n > maxSeq) maxSeq = n;
       }
     }
-    // séquence suivante (globale par année)
     let next = maxSeq + 1;
     let code = `${gradePart}${year}${String(next).padStart(5, "0")}`;
 
-    // Assure l’unicité même en cas de course
     const used = new Set((all || []).map((f: any) => f.code).filter(Boolean));
     while (used.has(code)) {
       next += 1;
@@ -294,7 +289,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     res.json({ data: rows });
   });
 
-  // détail (pour popup)
   app.get("/api/fixings/:id", async (req, res) => {
     const id = String(req.params.id);
     const rows = await storage.getAllFixings();
@@ -304,15 +298,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   app.post("/api/fixings", async (req, res) => {
-    const b = req.body || {};
-    if (!b.date || !b.route || !b.grade || !b.volume || !b.priceUsd || !b.counterparty) {
-      return res.status(400).json({ message: "Missing required fields" });
-    }
-    // Code itératif: ACRONYME_GRADE + YYYY + séquence 5 chiffres (globale par année)
-    if (!b.code) b.code = await buildSequentialFixCode(b);
+    try {
+      const b = req.body || {};
+      if (!b.date || !b.grade || !b.volume || b.priceUsd === undefined || b.priceUsd === null || b.priceUsd === "" || !b.counterparty) {
+        return res.status(400).json({ message: "Missing required fields" });
+      }
 
-    const saved = await storage.createFixing(b);
-    res.json({ data: saved });
+      if (!b.code) {
+        try {
+          b.code = await buildSequentialFixCode(b);
+        } catch (e) {
+          console.error("CODE GENERATION ERROR:", e);
+        }
+      }
+
+      const saved = await storage.createFixing(b);
+      res.json({ data: saved });
+    } catch (e: any) {
+      console.error("CREATE FIXING ERROR:", e);
+      const status = Number(e?.status) || 500;
+      res.status(status).json({
+        message: e?.message || "Failed to create fixing",
+      });
+    }
   });
 
   app.put("/api/fixings/:id", async (req, res) => {
@@ -321,7 +329,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const updated = await storage.updateFixing(id, req.body || {});
       res.json({ data: updated });
     } catch (e: any) {
-      res.status(404).json({ message: e?.message || "Fixing not found" });
+      console.error("UPDATE FIXING ERROR:", e);
+      const status = Number(e?.status) || 500;
+      res.status(status).json({ message: e?.message || "Failed to update fixing" });
     }
   });
 
@@ -330,12 +340,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const id = req.params.id;
       await storage.deleteFixing(id);
       res.json({ data: { id } });
-    } catch {
-      res.status(404).json({ message: "Fixing not found" });
+    } catch (e: any) {
+      console.error("DELETE FIXING ERROR:", e);
+      res.status(404).json({ message: e?.message || "Fixing not found" });
     }
   });
 
-  // export CSV
   app.get("/api/fixings/:id/export", async (req, res) => {
     try {
       const id = req.params.id;
@@ -359,15 +369,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   /* --------------- Vessels / Navires --------------- */
-  // mêmes handlers exposés sur /api/vessels, /api/vessel, /api/navires, /api/navire
   function registerVesselRoutes(base: string) {
-    // LIST
     app.get(base, async (_req, res) => {
       const rows = await storage.getAllVessels();
       res.json({ data: rows });
     });
 
-    // CREATE (accepte totalQtyMt + allocations[] en option)
     app.post(base, async (req, res) => {
       try {
         const b = req.body || {};
@@ -428,7 +435,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
     });
 
-    // UPDATE
     app.put(`${base}/:id`, async (req, res) => {
       try {
         const updated = await storage.updateVessel(req.params.id, req.body || {});
@@ -438,7 +444,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
     });
 
-    // DELETE
     app.delete(`${base}/:id`, async (req, res) => {
       try {
         await storage.deleteVessel(req.params.id);
@@ -449,20 +454,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
     });
   }
 
-  // Enregistre toutes les variantes utilisées par le front
   registerVesselRoutes("/api/vessels");
   registerVesselRoutes("/api/vessel");
   registerVesselRoutes("/api/navires");
   registerVesselRoutes("/api/navire");
 
   /* ----------------- Contrats API ----------------- */
-  // ---- Normalisation Contrats (UI -> storage) ----
   const toStorageContractPayload = (b: any) => {
-    // Marché
     const market: "LOCAL" | "EXPORT" =
       b.market === "EXPORT" ? "EXPORT" : "LOCAL";
 
-    // Dates
     const contractDate: string =
       (typeof b.contractDate === "string" && b.contractDate) ||
       (typeof b.date === "string" && b.date) ||
@@ -478,19 +479,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       (typeof b.dateEnd === "string" && b.dateEnd) ||
       contractDate;
 
-    // Quantité (UI envoie quantityT)
     const quantityTons: number =
       (b.quantityT != null ? Number(b.quantityT) : undefined) ??
       (b.quantityTons != null ? Number(b.quantityTons) : undefined) ??
       0;
 
-    // Devise & prix
     const inferredCurrency: "USD" | "TND" =
-      b.priceCurrency === "TND" ? "TND" : "USD";
+      market === "LOCAL" ? "TND" : (b.priceCurrency === "TND" ? "TND" : "USD");
     const priceCurrency: "USD" | "TND" =
-      b.priceCurrency ?? (b.priceUsd != null ? "USD" : (b.priceTnd != null ? "TND" : inferredCurrency));
+      market === "LOCAL"
+        ? "TND"
+        : (b.priceCurrency ?? (b.priceUsd != null ? "USD" : (b.priceTnd != null ? "TND" : inferredCurrency)));
 
-    // L’UI peut envoyer pricePerT (USD/T ou TND/T selon priceCurrency)
     const pricePerT = b.pricePerT != null ? Number(b.pricePerT) : undefined;
 
     const priceUsd =
@@ -506,7 +506,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const fxRate = b.fxRate != null ? Number(b.fxRate) : undefined;
 
     return {
-      // >>>>> IMPORTANT: le storage attend `contractDate` et `quantityTons`
       contractDate,
       market,
       clientId: String(b.clientId || ""),
@@ -524,7 +523,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     };
   };
 
-  // helper to register same handlers on multiple base paths
   const registerContractRoutes = (base: string) => {
     app.get(`${base}`, async (_req, res) => {
       const rows = await storage.getAllContracts();
@@ -542,7 +540,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         if (!payload.quantityTons || payload.quantityTons <= 0) {
           return res.status(400).json({ message: "quantityTons must be > 0" });
         }
-        // validation prix selon devise
         if (payload.priceCurrency === "USD" && (payload.priceUsd == null)) {
           return res.status(400).json({ message: "priceUsd is required when priceCurrency=USD" });
         }
@@ -563,7 +560,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const b = req.body || {};
         const patch = toStorageContractPayload(b);
 
-        // PATCH: ne pas écraser avec undefined
         Object.keys(patch).forEach(k => {
           if ((patch as any)[k] === undefined) delete (patch as any)[k];
         });
@@ -586,10 +582,184 @@ export async function registerRoutes(app: Express): Promise<Server> {
     });
   };
 
-  // Primary path + alias FR + singulier
   registerContractRoutes("/api/contracts");
   registerContractRoutes("/api/contrats");
   registerContractRoutes("/api/contract");
+
+  /* -------- Affectations contrats / fixings -------- */
+  app.get("/api/contracts/:id/requirements", async (req, res) => {
+    try {
+      const rows = await storage.getContractRequirements(String(req.params.id));
+      res.json({ data: rows });
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message || "Failed to fetch contract requirements" });
+    }
+  });
+
+  app.get("/api/contracts/:id/allocations", async (req, res) => {
+    try {
+      const rows = await storage.getContractAllocations(String(req.params.id));
+      res.json({ data: rows });
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message || "Failed to fetch contract allocations" });
+    }
+  });
+
+  app.get("/api/contracts/:id/coverage", async (req, res) => {
+    try {
+      const coverage = await storage.getContractCoverage(String(req.params.id));
+      res.json({ data: coverage });
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message || "Failed to compute contract coverage" });
+    }
+  });
+
+  app.post("/api/contracts/:id/allocate", async (req, res) => {
+    try {
+      const b = req.body || {};
+      const fixingId = String(b.fixingId || "").trim();
+      const gradeName = String(b.gradeName || "").trim();
+      const qty = Number(b.qty);
+
+      if (!fixingId) return res.status(400).json({ message: "fixingId is required" });
+      if (!gradeName) return res.status(400).json({ message: "gradeName is required" });
+      if (!Number.isFinite(qty) || qty <= 0) {
+        return res.status(400).json({ message: "qty must be > 0" });
+      }
+
+      const saved = await storage.allocateFixing({
+        contractId: String(req.params.id),
+        fixingId,
+        gradeName,
+        qty,
+      });
+
+      res.json({ data: saved });
+    } catch (e: any) {
+      const status = Number(e?.status) || 400;
+      res.status(status).json({ message: e?.message || "Failed to allocate fixing" });
+    }
+  });
+
+  app.delete("/api/allocations/:id", async (req, res) => {
+    try {
+      const id = String(req.params.id);
+      await storage.deleteAllocation(id);
+      res.json({ data: { id } });
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message || "Failed to delete allocation" });
+    }
+  });
+
+  app.get("/api/allocation-summary/grades", async (_req, res) => {
+    try {
+      const rows = await storage.getGradeAllocationSummary();
+      res.json({ data: rows });
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message || "Failed to fetch allocation summary" });
+    }
+  });
+
+  app.get("/api/fixings/:id/available", async (req, res) => {
+    try {
+      const availableQty = await storage.getFixingAvailableQty(String(req.params.id));
+      res.json({ data: { fixingId: String(req.params.id), availableQty } });
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message || "Failed to fetch fixing availability" });
+    }
+  });
+
+  /* ===== PRODUCTS ===== */
+  app.get("/api/products", async (_req, res) => {
+    try {
+      const rows = await storage.getAllProducts();
+      res.json({ data: rows });
+    } catch (e: any) {
+      res.status(500).json({ message: e?.message || "Failed to fetch products" });
+    }
+  });
+
+  app.post("/api/products", async (req, res) => {
+    try {
+      const b = req.body || {};
+      const created = await storage.createProduct({
+        name: String(b.name || "").trim(),
+        reference: b.reference ?? null,
+        composition: Array.isArray(b.composition) ? b.composition : [],
+      });
+      res.json({ data: created });
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message || "Failed to create product" });
+    }
+  });
+
+  app.put("/api/products/:id", async (req, res) => {
+    try {
+      const updated = await storage.updateProduct(
+        String(req.params.id),
+        req.body || {}
+      );
+      res.json({ data: updated });
+    } catch (e: any) {
+      res.status(404).json({ message: e?.message || "Product not found" });
+    }
+  });
+
+  app.delete("/api/products/:id", async (req, res) => {
+    try {
+      const id = String(req.params.id);
+      await storage.deleteProduct(id);
+      res.json({ data: { id } });
+    } catch (e: any) {
+      res.status(404).json({ message: e?.message || "Product not found" });
+    }
+  });
+
+  /* ===== CLIENTS ===== */
+  app.get("/api/clients", async (_req, res) => {
+    try {
+      const rows = await storage.getAllClients();
+      res.json({ data: rows });
+    } catch (e: any) {
+      res.status(500).json({ message: e?.message || "Failed to fetch clients" });
+    }
+  });
+
+  app.post("/api/clients", async (req, res) => {
+    try {
+      const b = req.body || {};
+      const created = await storage.createClient({
+        name: String(b.name || "").trim(),
+        market: b.market === "EXPORT" ? "EXPORT" : "LOCAL",
+        terms: String(b.terms || ""),
+      } as any);
+      res.json({ data: created });
+    } catch (e: any) {
+      res.status(400).json({ message: e?.message || "Failed to create client" });
+    }
+  });
+
+  app.put("/api/clients/:id", async (req, res) => {
+    try {
+      const updated = await storage.updateClient(
+        String(req.params.id),
+        req.body || {}
+      );
+      res.json({ data: updated });
+    } catch (e: any) {
+      res.status(404).json({ message: e?.message || "Client not found" });
+    }
+  });
+
+  app.delete("/api/clients/:id", async (req, res) => {
+    try {
+      const id = String(req.params.id);
+      await storage.deleteClient(id);
+      res.json({ data: { id } });
+    } catch (e: any) {
+      res.status(404).json({ message: e?.message || "Client not found" });
+    }
+  });
 
   /* --------------- 404 API --------------- */
   app.all("/api/*", (_req, res) => {
