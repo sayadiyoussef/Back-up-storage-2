@@ -382,35 +382,64 @@ export async function registerRoutes(app: Express): Promise<Server> {
         if (!name) return res.status(400).json({ message: "name is required" });
 
         const totalQtyMt =
-          b.totalQtyMt !== undefined ? Number(b.totalQtyMt) : undefined;
-        const allocations = Array.isArray(b.allocations) ? b.allocations : [];
+          b.quantityTotal !== undefined && b.quantityTotal !== ""
+            ? Number(b.quantityTotal)
+            : b.totalQtyMt !== undefined && b.totalQtyMt !== ""
+              ? Number(b.totalQtyMt)
+              : undefined;
+
+        const allocations = Array.isArray(b.gradeAllocations)
+          ? b.gradeAllocations
+          : Array.isArray(b.allocations)
+            ? b.allocations
+            : [];
 
         if (totalQtyMt !== undefined && !(Number.isFinite(totalQtyMt) && totalQtyMt >= 0)) {
-          return res.status(400).json({ message: "totalQtyMt must be a non-negative number" });
+          return res.status(400).json({ message: "quantityTotal must be a non-negative number" });
         }
 
         if (allocations.length) {
-          for (const a of allocations) {
-            if (!a) return res.status(400).json({ message: "Invalid allocation entry" });
-            const gid = typeof a.gradeId === "string" ? parseInt(a.gradeId, 10) : a.gradeId;
-            const qty = typeof a.qtyMt === "string" ? parseFloat(a.qtyMt) : a.qtyMt;
-            if (!Number.isInteger(gid)) return res.status(400).json({ message: "allocation.gradeId must be an integer" });
-            if (!Number.isFinite(qty) || qty < 0) return res.status(400).json({ message: "allocation.qtyMt must be >= 0" });
-          }
           const validGrades = await storage.getAllOilGrades();
           const validIds = new Set(validGrades.map((g: any) => g.id));
+          const validNames = new Set(validGrades.map((g: any) => String(g.name || "").trim().toLowerCase()));
+
           for (const a of allocations) {
-            const gid = typeof a.gradeId === "string" ? parseInt(a.gradeId, 10) : a.gradeId;
-            if (!validIds.has(gid)) return res.status(400).json({ message: `Unknown gradeId ${gid}` });
+            if (!a) return res.status(400).json({ message: "Invalid allocation entry" });
+
+            const gidRaw = a.gradeId;
+            const gid = gidRaw === undefined || gidRaw === null || gidRaw === ""
+              ? undefined
+              : typeof gidRaw === "string"
+                ? parseInt(gidRaw, 10)
+                : gidRaw;
+
+            const gradeName = String(a.gradeName || a.grade || "").trim();
+            const qtyRaw = a.qty ?? a.qtyMt ?? a.quantity ?? a.quantityMt;
+            const qty = typeof qtyRaw === "string" ? parseFloat(qtyRaw) : qtyRaw;
+
+            if (gid !== undefined && !Number.isInteger(gid)) {
+              return res.status(400).json({ message: "allocation.gradeId must be an integer" });
+            }
+            if (gid !== undefined && !validIds.has(gid)) {
+              return res.status(400).json({ message: `Unknown gradeId ${gid}` });
+            }
+            if (!gid && (!gradeName || !validNames.has(gradeName.toLowerCase()))) {
+              return res.status(400).json({ message: `Unknown gradeName ${gradeName || "empty"}` });
+            }
+            if (!Number.isFinite(qty) || qty < 0) {
+              return res.status(400).json({ message: "allocation.qty must be >= 0" });
+            }
           }
+
           if (totalQtyMt !== undefined) {
-            const sum = allocations.reduce(
-              (acc: number, a: any) => acc + (typeof a.qtyMt === "string" ? parseFloat(a.qtyMt) : a.qtyMt),
-              0
-            );
+            const sum = allocations.reduce((acc: number, a: any) => {
+              const qtyRaw = a.qty ?? a.qtyMt ?? a.quantity ?? a.quantityMt;
+              const qty = typeof qtyRaw === "string" ? parseFloat(qtyRaw) : qtyRaw;
+              return acc + (Number.isFinite(qty) ? Number(qty) : 0);
+            }, 0);
             if (sum > totalQtyMt) {
               return res.status(400).json({
-                message: `Sum of allocations (${sum}) exceeds totalQtyMt (${totalQtyMt})`,
+                message: `Sum of allocations (${sum}) exceeds quantityTotal (${totalQtyMt})`,
               });
             }
           }
@@ -424,8 +453,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
           eta: b.eta ?? undefined,
           origin: b.origin ?? undefined,
           destination: b.destination ?? undefined,
-          totalQtyMt,
-          allocations,
+          tender: b.tender ?? undefined,
+          supplier: b.supplier ?? undefined,
+          quantityTotal: totalQtyMt,
+          gradeAllocations: allocations,
         };
 
         const saved = await storage.createVessel(payload);

@@ -525,7 +525,98 @@ class MemStorage implements IStorage {
         grade_name TEXT NOT NULL,
         allocated_qty REAL NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS fixings (
+        id TEXT PRIMARY KEY,
+        date TEXT,
+        route TEXT,
+        grade TEXT,
+        volume TEXT,
+        price_usd REAL,
+        counterparty TEXT,
+        vessel TEXT,
+        freight_usd REAL,
+        notes TEXT,
+        code TEXT
+      );
+      CREATE TABLE IF NOT EXISTS vessels (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        type TEXT,
+        dwt REAL,
+        status TEXT,
+        eta TEXT,
+        origin TEXT,
+        destination TEXT,
+        tender TEXT,
+        supplier TEXT,
+        quantity_total REAL,
+        grade_allocations_json TEXT
+      );
     `);
+  }
+
+  private upsertFixingToSqlite(f: any) {
+    this.db.prepare(`
+      INSERT INTO fixings (
+        id, date, route, grade, volume, price_usd, counterparty, vessel, freight_usd, notes, code
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        date = excluded.date,
+        route = excluded.route,
+        grade = excluded.grade,
+        volume = excluded.volume,
+        price_usd = excluded.price_usd,
+        counterparty = excluded.counterparty,
+        vessel = excluded.vessel,
+        freight_usd = excluded.freight_usd,
+        notes = excluded.notes,
+        code = excluded.code
+    `).run(
+      f.id,
+      f.date ?? null,
+      f.route ?? null,
+      f.grade ?? null,
+      f.volume ?? null,
+      f.priceUsd ?? null,
+      f.counterparty ?? null,
+      f.vessel ?? null,
+      f.freightUsd ?? null,
+      f.notes ?? null,
+      f.code ?? null
+    );
+  }
+
+  private upsertVesselToSqlite(v: Vessel) {
+    this.db.prepare(`
+      INSERT INTO vessels (
+        id, name, type, dwt, status, eta, origin, destination, tender, supplier, quantity_total, grade_allocations_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        type = excluded.type,
+        dwt = excluded.dwt,
+        status = excluded.status,
+        eta = excluded.eta,
+        origin = excluded.origin,
+        destination = excluded.destination,
+        tender = excluded.tender,
+        supplier = excluded.supplier,
+        quantity_total = excluded.quantity_total,
+        grade_allocations_json = excluded.grade_allocations_json
+    `).run(
+      v.id,
+      v.name,
+      v.type ?? null,
+      v.dwt ?? null,
+      v.status ?? null,
+      v.eta ?? null,
+      v.origin ?? null,
+      v.destination ?? null,
+      v.tender ?? null,
+      v.supplier ?? null,
+      v.quantityTotal ?? null,
+      JSON.stringify(v.gradeAllocations || [])
+    );
   }
 
   private syncMapsToSqliteIfEmpty() {
@@ -542,6 +633,20 @@ class MemStorage implements IStorage {
       const stmt = this.db.prepare(`INSERT INTO clients (id, market, name, terms, updated_at) VALUES (?, ?, ?, ?, ?)`);
       for (const c of this.clients.values()) {
         stmt.run(c.id, c.market, c.name, c.terms, c.updatedAt ?? new Date().toISOString());
+      }
+    }
+
+    const fixingCount = Number((this.db.prepare(`SELECT COUNT(*) as c FROM fixings`).get() as any).c || 0);
+    if (fixingCount === 0) {
+      for (const f of this.fixings.values()) {
+        this.upsertFixingToSqlite(f);
+      }
+    }
+
+    const vesselCount = Number((this.db.prepare(`SELECT COUNT(*) as c FROM vessels`).get() as any).c || 0);
+    if (vesselCount === 0) {
+      for (const v of this.vessels.values()) {
+        this.upsertVesselToSqlite(v);
       }
     }
   }
@@ -606,9 +711,53 @@ class MemStorage implements IStorage {
         if (seq > cur) this.contractCounters.set(key, seq);
       }
     }
+
+    this.fixings.clear();
+    const fixingRows = this.db.prepare(`SELECT * FROM fixings ORDER BY date DESC`).all() as any[];
+    for (const r of fixingRows) {
+      this.fixings.set(r.id, {
+        id: r.id,
+        date: r.date ?? undefined,
+        route: r.route ?? undefined,
+        grade: r.grade ?? undefined,
+        volume: r.volume ?? undefined,
+        priceUsd: r.price_usd == null ? undefined : Number(r.price_usd),
+        counterparty: r.counterparty ?? undefined,
+        vessel: r.vessel ?? undefined,
+        freightUsd: r.freight_usd == null ? undefined : Number(r.freight_usd),
+        notes: r.notes ?? undefined,
+        code: r.code ?? undefined,
+      });
+    }
+
+    this.vessels.clear();
+    const vesselRows = this.db.prepare(`SELECT * FROM vessels ORDER BY name`).all() as any[];
+    for (const r of vesselRows) {
+      let gradeAllocations: GradeAllocation[] = [];
+      try {
+        gradeAllocations = JSON.parse(r.grade_allocations_json || '[]');
+      } catch {
+        gradeAllocations = [];
+      }
+      this.vessels.set(r.id, {
+        id: r.id,
+        name: r.name,
+        type: r.type ?? undefined,
+        dwt: r.dwt == null ? undefined : Number(r.dwt),
+        status: r.status ?? undefined,
+        eta: r.eta ?? undefined,
+        origin: r.origin ?? undefined,
+        destination: r.destination ?? undefined,
+        tender: r.tender ?? undefined,
+        supplier: r.supplier ?? undefined,
+        quantityTotal: r.quantity_total == null ? undefined : Number(r.quantity_total),
+        gradeAllocations,
+      });
+    }
   }
 
   constructor() {
+
     // Seed users
     const seedUsers: User[] = [
       {
@@ -1032,10 +1181,13 @@ class MemStorage implements IStorage {
     };
 
     this.fixings.set(id, f);
+    this.upsertFixingToSqlite(f);
 
     if (f.vessel && !Array.from(this.vessels.values()).some((v: any) => v.name === f.vessel)) {
       const vId = randomUUID();
-      this.vessels.set(vId, { id: vId, name: f.vessel, type: "Tanker", dwt: 0, status: "Planned" });
+      const vessel = { id: vId, name: f.vessel, type: "Tanker", dwt: 0, status: "Planned" };
+      this.vessels.set(vId, vessel);
+      this.upsertVesselToSqlite(vessel);
     }
     return f;
   }
@@ -1060,75 +1212,100 @@ class MemStorage implements IStorage {
     });
 
     this.fixings.set(id, next);
+    this.upsertFixingToSqlite(next);
     if (next.vessel && !Array.from(this.vessels.values()).some((v: any) => v.name === next.vessel)) {
       const vId = randomUUID();
-      this.vessels.set(vId, { id: vId, name: next.vessel, type: "Tanker", dwt: 0, status: "Unknown" });
+      const vessel = { id: vId, name: next.vessel, type: "Tanker", dwt: 0, status: "Unknown" };
+      this.vessels.set(vId, vessel);
+      this.upsertVesselToSqlite(vessel);
     }
     return next;
   }
   async deleteFixing(id: string) {
     this.db.prepare(`DELETE FROM contract_fixing_allocations WHERE fixing_id = ?`).run(id);
+    this.db.prepare(`DELETE FROM fixings WHERE id = ?`).run(id);
     this.fixings.delete(id);
+  }
+
+  private normalizeVesselAllocations(data: any): GradeAllocation[] | undefined {
+    const raw = Array.isArray(data.gradeAllocations)
+      ? data.gradeAllocations
+      : Array.isArray(data.allocations)
+        ? data.allocations
+        : undefined;
+
+    if (!raw) return undefined;
+
+    return raw
+      .map((a: any) => ({
+        gradeId: a.gradeId !== undefined && a.gradeId !== null && a.gradeId !== "" ? Number(a.gradeId) : undefined,
+        gradeName: String(a.gradeName || a.grade || "").trim(),
+        qty: this.parseNumberLoose(a.qty ?? a.qtyMt ?? a.quantity ?? a.quantityMt, 0),
+      }))
+      .filter((a: any) => a.gradeName && a.qty > 0);
   }
 
   async createVessel(data: any) {
     const id = randomUUID();
+    const gradeAllocations = this.normalizeVesselAllocations(data);
+    const quantityTotal = this.parseNumberLoose(data.quantityTotal ?? data.totalQtyMt, 0) || undefined;
+
     const v: Vessel = {
       id,
-      name: data.name,
+      name: String(data.name || "").trim(),
       type: data.type || "Tanker",
       dwt: this.parseNumberLoose(data.dwt, 0),
       status: data.status || "Planned",
-      eta: data.eta,
-      origin: data.origin,
-      destination: data.destination,
-
-      // nouveaux champs (facultatifs)
-      tender: data.tender ?? undefined,
-      supplier: data.supplier ?? undefined,
-      quantityTotal: this.parseNumberLoose(data.quantityTotal, 0) || undefined,
-      gradeAllocations: Array.isArray(data.gradeAllocations)
-        ? data.gradeAllocations
-            .map((a:any)=>({
-              gradeId: a.gradeId ? Number(a.gradeId) : undefined,
-              gradeName: String(a.gradeName || "").trim(),
-              qty: this.parseNumberLoose(a.qty, 0),
-            }))
-            .filter((a:any)=> a.gradeName && a.qty > 0)
-        : undefined,
+      eta: data.eta || undefined,
+      origin: data.origin || undefined,
+      destination: data.destination || undefined,
+      tender: data.tender || undefined,
+      supplier: data.supplier || undefined,
+      quantityTotal,
+      gradeAllocations,
     };
+
+    if (!v.name) throw new Error("Vessel name is required");
+
     this.vessels.set(id, v);
+    this.upsertVesselToSqlite(v);
     return v;
   }
+
   async updateVessel(id: string, data: any) {
     const existing = this.vessels.get(id);
     if (!existing) throw new Error("Vessel not found");
+
+    const normalizedAllocations = this.normalizeVesselAllocations(data);
+    const hasQuantity = data.quantityTotal !== undefined || data.totalQtyMt !== undefined;
+
     const next: Vessel = {
       ...existing,
       ...data,
       id,
-      dwt: this.parseNumberLoose(data.dwt, existing.dwt ?? 0),
+      name: data.name !== undefined ? String(data.name).trim() : existing.name,
+      dwt: data.dwt !== undefined ? this.parseNumberLoose(data.dwt, existing.dwt ?? 0) : existing.dwt,
       type: data.type || existing.type || "Tanker",
       status: data.status || existing.status || "Unknown",
-
-      // normalisation nouveaux champs
-      quantityTotal: (data.quantityTotal !== undefined)
-        ? (this.parseNumberLoose(data.quantityTotal, 0) || undefined)
+      eta: data.eta !== undefined ? (data.eta || undefined) : existing.eta,
+      origin: data.origin !== undefined ? (data.origin || undefined) : existing.origin,
+      destination: data.destination !== undefined ? (data.destination || undefined) : existing.destination,
+      tender: data.tender !== undefined ? (data.tender || undefined) : existing.tender,
+      supplier: data.supplier !== undefined ? (data.supplier || undefined) : existing.supplier,
+      quantityTotal: hasQuantity
+        ? (this.parseNumberLoose(data.quantityTotal ?? data.totalQtyMt, 0) || undefined)
         : existing.quantityTotal,
-      gradeAllocations: Array.isArray(data.gradeAllocations)
-        ? data.gradeAllocations
-            .map((a:any)=>({
-              gradeId: a.gradeId ? Number(a.gradeId) : undefined,
-              gradeName: String(a.gradeName || "").trim(),
-              qty: this.parseNumberLoose(a.qty, 0),
-            }))
-            .filter((a:any)=> a.gradeName && a.qty > 0)
-        : existing.gradeAllocations,
+      gradeAllocations: normalizedAllocations !== undefined ? normalizedAllocations : existing.gradeAllocations,
     };
+
+    if (!next.name) throw new Error("Vessel name is required");
+
     this.vessels.set(id, next);
+    this.upsertVesselToSqlite(next);
     return next;
   }
   async deleteVessel(id: string) {
+    this.db.prepare(`DELETE FROM vessels WHERE id = ?`).run(id);
     this.vessels.delete(id);
   }
 
@@ -1458,39 +1635,6 @@ class MemStorage implements IStorage {
     return Math.max(0, total - used);
   }
 
-async getContractRequirements(contractId: string): Promise<ContractRequirement[]> {
-  this.loadSqliteToMaps();
-
-  let rows = this.db.prepare(`
-    SELECT id, contract_id, grade_name, required_qty
-    FROM contract_requirements
-    WHERE contract_id = ?
-    ORDER BY grade_name
-  `).all(contractId) as any[];
-
-  if (!rows.length) {
-    const contract = this.contracts.get(contractId);
-    if (contract) {
-      const computed = await this.computeContractRequirements(contract);
-      if (computed.length) {
-        this.replaceContractRequirements(contractId, computed);
-        rows = this.db.prepare(`
-          SELECT id, contract_id, grade_name, required_qty
-          FROM contract_requirements
-          WHERE contract_id = ?
-          ORDER BY grade_name
-        `).all(contractId) as any[];
-      }
-    }
-  }
-
-  return rows.map((r) => ({
-    id: r.id,
-    contractId: r.contract_id,
-    gradeName: r.grade_name,
-    requiredQty: Number(r.required_qty),
-  }));
-}
 
 async allocateFixing(data: {
   contractId: string;
