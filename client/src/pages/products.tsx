@@ -24,7 +24,21 @@ type Product = {
 const fetchJSON = async (url: string, init?: RequestInit) => {
   const res = await fetch(url, init);
   const txt = await res.text();
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} ${txt || ""}`);
+
+  if (!res.ok) {
+    let message = `${res.status} ${res.statusText}`;
+    try {
+      const parsed = txt ? JSON.parse(txt) : null;
+      message = parsed?.message || parsed?.error || message;
+    } catch {
+      if (txt) message = txt;
+    }
+
+    const err: any = new Error(message);
+    err.status = res.status;
+    throw err;
+  }
+
   return txt ? JSON.parse(txt) : {};
 };
 
@@ -143,9 +157,14 @@ export default function ProductsPage() {
       toast({ title: "Produit supprimé" });
     },
     onError: (e: any) => {
+      const message =
+        e?.status === 409
+          ? e.message || "Impossible de supprimer ce produit : il est utilisé dans des contrats."
+          : e?.message || "Échec de la suppression";
+
       toast({
-        title: "Erreur",
-        description: e?.message || "Échec de la suppression",
+        title: "Suppression impossible",
+        description: message,
         variant: "destructive",
       });
     },
@@ -230,7 +249,13 @@ export default function ProductsPage() {
                             <Button
                               variant="destructive"
                               onClick={() => {
-                                if (confirm("Supprimer ce produit ?")) deleteMutation.mutate(p.id);
+                                if (
+                                  confirm(
+                                    "Supprimer ce produit ? Si ce produit est utilisé dans un contrat, la suppression sera bloquée."
+                                  )
+                                ) {
+                                  deleteMutation.mutate(p.id);
+                                }
                               }}
                             >
                               <Trash2 className="h-4 w-4 mr-2" />

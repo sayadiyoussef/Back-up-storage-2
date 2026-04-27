@@ -19,12 +19,15 @@ import Grades from "@/pages/grades";
 import Settings from "@/pages/settings";
 import NotFound from "@/pages/not-found";
 
-// ✅ NEW: pages Produits, Clients & Contrats
+// ✅ EXISTANT
 import Products from "@/pages/products";
 import Clients from "@/pages/clients";
 import Contracts from "@/pages/contracts";
 
-// Un simple garde : si pas loggé => Landing
+// ✅ NOUVEAU MODULE
+import TargetMargins from "@/pages/target-margins";
+
+// Guard
 function Protected({ component: Cmp }: { component: React.ComponentType }) {
   const { isAuthenticated } = useAuth();
   return isAuthenticated ? <Cmp /> : <Landing />;
@@ -35,7 +38,7 @@ function Router() {
 
   return (
     <Switch>
-      {/* Racine : Dashboard si loggé, sinon Landing */}
+      {/* Racine */}
       <Route path="/" component={isAuthenticated ? Dashboard : Landing} />
 
       {/* Routes protégées */}
@@ -46,9 +49,14 @@ function Router() {
       <Route path="/analytics" component={() => <Protected component={Analytics} />} />
       <Route path="/fixings" component={() => <Protected component={Fixings} />} />
       <Route path="/navires" component={() => <Protected component={Navires} />} />
+
       <Route path="/products" component={() => <Protected component={Products} />} />
       <Route path="/clients" component={() => <Protected component={Clients} />} />
       <Route path="/contracts" component={() => <Protected component={Contracts} />} />
+
+      {/* ✅ NOUVELLE ROUTE */}
+      <Route path="/target-margins" component={() => <Protected component={TargetMargins} />} />
+
       <Route path="/knowledge" component={() => <Protected component={Knowledge} />} />
       <Route path="/settings" component={() => <Protected component={Settings} />} />
 

@@ -40,8 +40,26 @@ type Client = {
 const fetchJSON = async (url: string, init?: RequestInit) => {
   const res = await fetch(url, init);
   const txt = await res.text();
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} ${txt || ""}`);
+  if (!res.ok) {
+    let message = txt || res.statusText || "Erreur serveur";
+    try {
+      const parsed = txt ? JSON.parse(txt) : null;
+      message = parsed?.message || parsed?.error || message;
+    } catch {
+      // réponse non JSON: on garde le texte brut
+    }
+    const err: any = new Error(message);
+    err.status = res.status;
+    throw err;
+  }
   return txt ? JSON.parse(txt) : {};
+};
+
+const getApiErrorMessage = (e: any, fallback: string) => {
+  const message = String(e?.message || fallback);
+  if (message.includes("Impossible de supprimer ce client")) return message;
+  if (e?.status === 409) return message || "Action refusée par les règles de sécurité opérationnelles.";
+  return message;
 };
 
 /* -----------------------------------------
@@ -214,7 +232,7 @@ export default function ClientsPage() {
     onError: (e: any) => {
       toast({
         title: "Erreur",
-        description: e?.message || "Échec de l’enregistrement du client",
+        description: getApiErrorMessage(e, "Échec de l’enregistrement du client"),
         variant: "destructive",
       });
     },
@@ -224,12 +242,13 @@ export default function ClientsPage() {
     mutationFn: async (id: string) => fetchJSON(`/api/clients/${id}`, { method: "DELETE" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["/api/clients"] });
+      qc.invalidateQueries({ queryKey: ["/api/contracts"] });
       toast({ title: "Client supprimé" });
     },
     onError: (e: any) => {
       toast({
-        title: "Erreur",
-        description: e?.message || "Échec de la suppression du client",
+        title: "Suppression impossible",
+        description: getApiErrorMessage(e, "Impossible de supprimer ce client."),
         variant: "destructive",
       });
     },
@@ -330,7 +349,7 @@ export default function ClientsPage() {
                                 <Button
                                   variant="destructive"
                                   onClick={() => {
-                                    if (confirm(`Supprimer ${c.name} ?`)) delClient.mutate(c.id);
+                                    if (confirm(`Supprimer ${c.name} ?\n\nSi ce client est utilisé dans un contrat, la suppression sera bloquée.`)) delClient.mutate(c.id);
                                   }}
                                   title="Supprimer"
                                 >

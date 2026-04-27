@@ -14,6 +14,7 @@ import {
   Package,   // Products
   Users,     // Clients
   FileText,  // ✅ NEW: Contrats
+  Target,
 } from "lucide-react";
 
 const navigation = [
@@ -26,6 +27,7 @@ const navigation = [
   { name: "Clients", href: "/clients", icon: Users },
   // ✅ NEW: Contrats juste après Clients
   { name: "Contrats", href: "/contracts", icon: FileText },
+  { name: "Marges cibles", href: "/target-margins", icon: Target },
   { name: "Base de connaissance", href: "/knowledge", icon: Layers },
   { name: "Market Data", href: "/market", icon: TrendingUp },
   { name: "Oil Grades", href: "/grades", icon: Layers },

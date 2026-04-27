@@ -11,6 +11,7 @@ import {
   type Client, type InsertClient,
   // Contrats
   type Contract, type InsertContract,
+  type TargetMargin, type InsertTargetMargin,
 } from "../shared/schema.ts";
 
 type ForwardPoint = { period: string; ask: number; code: string };
@@ -165,6 +166,13 @@ export interface IStorage {
   updateProduct(id: string, data: Partial<Omit<Product, "id" | "updatedAt">>): Promise<Product>;
   deleteProduct(id: string): Promise<void>;
 
+  // Marges cibles
+  getAllTargetMargins(): Promise<TargetMargin[]>;
+  createTargetMargin(data: InsertTargetMargin): Promise<TargetMargin>;
+  updateTargetMargin(id: string, data: Partial<Omit<TargetMargin, "id" | "updatedAt">>): Promise<TargetMargin>;
+  deleteTargetMargin(id: string): Promise<void>;
+  replaceTargetMargins(rows: InsertTargetMargin[]): Promise<TargetMargin[]>;
+
   // Clients
   getAllClients(): Promise<Client[]>;
   createClient(data: InsertClient): Promise<Client>;
@@ -220,6 +228,9 @@ class MemStorage implements IStorage {
   // Clients
   private clients = new Map<string, Client>();
 
+  // Marges cibles
+  private targetMargins = new Map<string, TargetMargin>();
+
   // Contrats
   private contracts = new Map<string, Contract>();
   /** Compteurs par (market-year) pour le code auto */
@@ -256,7 +267,22 @@ class MemStorage implements IStorage {
     if (v == null) return def;
     if (typeof v === "number" && Number.isFinite(v)) return v;
     if (typeof v === "string") {
-      const cleaned = v.replace(/[^\d.,-]/g, "").replace(",", ".");
+      let cleaned = v.replace(/[^\d.,-]/g, "").trim();
+      if (!cleaned) return def;
+
+      // 5,000 / 12,500.75 => thousands comma
+      if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(cleaned)) {
+        cleaned = cleaned.replace(/,/g, "");
+      }
+      // 5.000 / 12.500,75 => thousands dot + decimal comma
+      else if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(cleaned)) {
+        cleaned = cleaned.replace(/\./g, "").replace(",", ".");
+      }
+      // 12,5 => decimal comma
+      else {
+        cleaned = cleaned.replace(",", ".");
+      }
+
       const n = Number(cleaned);
       return Number.isFinite(n) ? n : def;
     }
@@ -416,10 +442,11 @@ class MemStorage implements IStorage {
     return (parts.join("") || "FIX").toUpperCase();
   }
   /** séquence suivante (globale par année) depuis les codes existants */
-  private nextFixingSeqForYear(year: number): number {
+  private nextFixingSeqForYear(year: number, excludeFixingId?: string): number {
     const re = new RegExp(`^[A-Z0-9]+${year}(\\d{5,})$`);
     let maxSeq = 0;
     for (const f of this.fixings.values()) {
+      if (excludeFixingId && (f as any).id === excludeFixingId) continue;
       const m = String((f as any).code || "").match(re);
       if (m) {
         const n = parseInt(m[1], 10);
@@ -429,13 +456,18 @@ class MemStorage implements IStorage {
     return maxSeq + 1;
   }
   /** Construit un code unique: ACRONYME_GRADE + YYYY + séquence(5) */
-  private buildFixingCode(gradeName: string, dateIso?: string): string {
+  private buildFixingCode(gradeName: string, dateIso?: string, excludeFixingId?: string): string {
     const acronym = this.makeGradeAcronym(gradeName);
     const d = dateIso ? new Date(dateIso) : new Date();
     const year = d.getFullYear();
-    let seq = this.nextFixingSeqForYear(year);
+    let seq = this.nextFixingSeqForYear(year, excludeFixingId);
 
-    const used = new Set(Array.from(this.fixings.values()).map((x: any) => x.code).filter(Boolean) as string[]);
+    const used = new Set(
+      Array.from(this.fixings.values())
+        .filter((x: any) => !excludeFixingId || x.id !== excludeFixingId)
+        .map((x: any) => x.code)
+        .filter(Boolean) as string[]
+    );
     let code = `${acronym}${year}${String(seq).padStart(5, "0")}`;
     while (used.has(code)) {
       seq += 1;
@@ -447,11 +479,20 @@ class MemStorage implements IStorage {
   // ---- Affectations contrats/fixings ----
   private async computeContractRequirements(contract: Contract): Promise<ContractRequirement[]> {
     const product = this.products.get(contract.productId);
-    if (!product) return [];
+    const snapshotComposition = (contract as any).productComposition;
+
+    // Important: un contrat conserve la composition produit utilisée à sa création.
+    // Les changements futurs de composition produit ne doivent pas modifier les anciens contrats.
+    const composition: ProductComponent[] =
+      Array.isArray(snapshotComposition) && snapshotComposition.length
+        ? snapshotComposition
+        : product?.composition || [];
+
+    if (!composition.length) return [];
 
     const qty = Number(contract.quantityTons) || 0;
 
-    return (product.composition || [])
+    return composition
       .map((c) => ({
         id: randomUUID(),
         contractId: contract.id,
@@ -492,6 +533,17 @@ class MemStorage implements IStorage {
         terms TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS target_margins (
+        id TEXT PRIMARY KEY,
+        market TEXT NOT NULL,
+        client_id TEXT,
+        client_name TEXT NOT NULL,
+        product_id TEXT,
+        product_name TEXT NOT NULL,
+        margin_tnd REAL,
+        margin_usd REAL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS contracts (
         id TEXT PRIMARY KEY,
         code TEXT NOT NULL,
@@ -501,6 +553,7 @@ class MemStorage implements IStorage {
         client_name TEXT NOT NULL,
         product_id TEXT NOT NULL,
         product_name TEXT NOT NULL,
+        product_composition_json TEXT,
         quantity_tons REAL NOT NULL,
         price_currency TEXT NOT NULL,
         price_usd REAL,
@@ -553,6 +606,13 @@ class MemStorage implements IStorage {
         grade_allocations_json TEXT
       );
     `);
+
+    // Migration douce pour les bases déjà créées avant l'ajout du snapshot produit.
+    try {
+      this.db.prepare(`ALTER TABLE contracts ADD COLUMN product_composition_json TEXT`).run();
+    } catch {
+      // Column already exists.
+    }
   }
 
   private upsertFixingToSqlite(f: any) {
@@ -676,11 +736,27 @@ class MemStorage implements IStorage {
       } as Client);
     }
 
+    this.targetMargins.clear();
+    const targetMarginRows = this.db.prepare(`SELECT * FROM target_margins ORDER BY market, client_name, product_name`).all() as any[];
+    for (const r of targetMarginRows) {
+      this.targetMargins.set(r.id, {
+        id: r.id,
+        market: r.market,
+        clientId: r.client_id ?? undefined,
+        clientName: r.client_name,
+        productId: r.product_id ?? undefined,
+        productName: r.product_name,
+        marginTnd: r.margin_tnd == null ? undefined : Number(r.margin_tnd),
+        marginUsd: r.margin_usd == null ? undefined : Number(r.margin_usd),
+        updatedAt: r.updated_at,
+      } as TargetMargin);
+    }
+
     this.contracts.clear();
     this.contractCounters.clear();
     const contractRows = this.db.prepare(`SELECT * FROM contracts ORDER BY contract_date DESC, created_at DESC`).all() as any[];
     for (const r of contractRows) {
-      const c: Contract = {
+      const c: Contract = ({
         id: r.id,
         code: r.code,
         market: r.market,
@@ -689,6 +765,13 @@ class MemStorage implements IStorage {
         clientName: r.client_name,
         productId: r.product_id,
         productName: r.product_name,
+        productComposition: (() => {
+          try {
+            return JSON.parse(r.product_composition_json || '[]');
+          } catch {
+            return [];
+          }
+        })(),
         quantityTons: Number(r.quantity_tons),
         priceCurrency: r.price_currency,
         priceUsd: r.price_usd == null ? undefined : Number(r.price_usd),
@@ -699,7 +782,7 @@ class MemStorage implements IStorage {
         notes: r.notes ?? undefined,
         createdAt: r.created_at,
         updatedAt: r.updated_at,
-      };
+      } as any);
       this.contracts.set(c.id, c);
 
       const year = new Date(c.contractDate).getFullYear();
@@ -1202,7 +1285,50 @@ class MemStorage implements IStorage {
 
     const next = this.normalizeFixingPayload(data, existing);
     next.id = id;
-    next.code = data.code ?? existing.code;
+
+    const gradeChanged =
+      String(next.grade || "").trim().toLowerCase() !==
+      String(existing.grade || "").trim().toLowerCase();
+
+    const allocationSummary = this.db.prepare(`
+      SELECT COUNT(*) as c, COALESCE(SUM(allocated_qty), 0) as total
+      FROM contract_fixing_allocations
+      WHERE fixing_id = ?
+    `).get(id) as any;
+    const hasAllocations = Number(allocationSummary?.c || 0) > 0;
+    const allocatedQty = Number(allocationSummary?.total || 0);
+
+    if (gradeChanged && hasAllocations) {
+      const err: any = new Error("Impossible de changer le grade : ce fixing est déjà affecté à un contrat.");
+      err.status = 409;
+      throw err;
+    }
+
+    const newFixingQty = this.parseVolumeMT(next.volume);
+    if (newFixingQty + 1e-9 < allocatedQty) {
+      const err: any = new Error(
+        `Impossible de réduire la quantité du fixing sous la quantité déjà affectée (${allocatedQty} MT).`
+      );
+      err.status = 409;
+      throw err;
+    }
+
+    const existingYear = new Date(existing.date || new Date()).getFullYear();
+    const nextYear = new Date(next.date || new Date()).getFullYear();
+    const yearChanged = existingYear !== nextYear;
+
+    const incomingCode =
+      data.code !== undefined && data.code !== null ? String(data.code).trim() : "";
+    const existingCode = String(existing.code || "").trim();
+    const userChangedCodeManually = incomingCode.length > 0 && incomingCode !== existingCode;
+
+    if (userChangedCodeManually) {
+      next.code = incomingCode;
+    } else if (gradeChanged || yearChanged || !existingCode) {
+      next.code = this.buildFixingCode(next.grade, next.date, id);
+    } else {
+      next.code = existing.code;
+    }
 
     this.assertFixingFitsVesselPlan({
       vesselName: next.vessel,
@@ -1222,62 +1348,112 @@ class MemStorage implements IStorage {
     return next;
   }
   async deleteFixing(id: string) {
-    this.db.prepare(`DELETE FROM contract_fixing_allocations WHERE fixing_id = ?`).run(id);
+    const used = this.db.prepare(`
+      SELECT COUNT(*) as c
+      FROM contract_fixing_allocations
+      WHERE fixing_id = ?
+    `).get(id) as any;
+
+    if (Number(used?.c || 0) > 0) {
+      const err: any = new Error("Impossible de supprimer ce fixing : il est déjà affecté à un ou plusieurs contrats.");
+      err.status = 409;
+      throw err;
+    }
+
     this.db.prepare(`DELETE FROM fixings WHERE id = ?`).run(id);
     this.fixings.delete(id);
   }
 
-  private normalizeVesselAllocations(data: any): GradeAllocation[] | undefined {
-    const raw = Array.isArray(data.gradeAllocations)
+  async createVessel(data: any) {
+    const id = randomUUID();
+    const v: Vessel = {
+      id,
+      name: data.name,
+      type: data.type || "Tanker",
+      dwt: this.parseNumberLoose(data.dwt, 0),
+      status: data.status || "Planned",
+      eta: data.eta,
+      origin: data.origin,
+      destination: data.destination,
+
+      // nouveaux champs (facultatifs)
+      tender: data.tender ?? undefined,
+      supplier: data.supplier ?? undefined,
+      quantityTotal: this.parseNumberLoose(data.quantityTotal ?? data.totalQtyMt, 0) || undefined,
+gradeAllocations: Array.isArray(data.gradeAllocations ?? data.allocations)
+  ? (data.gradeAllocations ?? data.allocations)
+            .map((a:any)=>({
+              gradeId: a.gradeId ? Number(a.gradeId) : undefined,
+              gradeName: String(a.gradeName || "").trim(),
+              qty: this.parseNumberLoose(a.qty ?? a.qtyMt, 0),
+            }))
+            .filter((a:any)=> a.gradeName && a.qty > 0)
+        : undefined,
+    };
+    this.vessels.set(id, v);
+    this.upsertVesselToSqlite(v);
+    return v;
+  }
+  async updateVessel(id: string, data: any) {
+    const existing = this.vessels.get(id);
+    if (!existing) throw new Error("Vessel not found");
+
+    const consumption = this.computeVesselConsumption(existing.name);
+
+    const hasQuantity = data.quantityTotal !== undefined || data.totalQtyMt !== undefined;
+    const nextQuantityTotal = hasQuantity
+      ? (this.parseNumberLoose(data.quantityTotal ?? data.totalQtyMt, 0) || undefined)
+      : existing.quantityTotal;
+
+    const rawAllocations = Array.isArray(data.gradeAllocations)
       ? data.gradeAllocations
       : Array.isArray(data.allocations)
         ? data.allocations
         : undefined;
 
-    if (!raw) return undefined;
+    const nextGradeAllocations = rawAllocations
+      ? rawAllocations
+          .map((a: any) => ({
+            gradeId: a.gradeId ? Number(a.gradeId) : undefined,
+            gradeName: String(a.gradeName || a.grade || "").trim(),
+            qty: this.parseNumberLoose(a.qty ?? a.qtyMt ?? a.quantity ?? a.quantityMt, 0),
+          }))
+          .filter((a: any) => a.gradeName && a.qty > 0)
+      : existing.gradeAllocations;
 
-    return raw
-      .map((a: any) => ({
-        gradeId: a.gradeId !== undefined && a.gradeId !== null && a.gradeId !== "" ? Number(a.gradeId) : undefined,
-        gradeName: String(a.gradeName || a.grade || "").trim(),
-        qty: this.parseNumberLoose(a.qty ?? a.qtyMt ?? a.quantity ?? a.quantityMt, 0),
-      }))
-      .filter((a: any) => a.gradeName && a.qty > 0);
-  }
+    if (nextQuantityTotal !== undefined && nextQuantityTotal + 1e-9 < consumption.total) {
+      const err: any = new Error(
+        `Impossible de réduire la quantité totale du navire sous la quantité déjà fixée (${consumption.total} MT).`
+      );
+      err.status = 409;
+      throw err;
+    }
 
-  async createVessel(data: any) {
-    const id = randomUUID();
-    const gradeAllocations = this.normalizeVesselAllocations(data);
-    const quantityTotal = this.parseNumberLoose(data.quantityTotal ?? data.totalQtyMt, 0) || undefined;
+    if (nextGradeAllocations && nextGradeAllocations.length) {
+      for (const plan of nextGradeAllocations) {
+        const used = consumption.byGrade.get(String(plan.gradeName || "").trim()) || 0;
+        if (Number(plan.qty || 0) + 1e-9 < used) {
+          const err: any = new Error(
+            `Impossible de réduire le plan ${plan.gradeName} sous la quantité déjà fixée (${used} MT).`
+          );
+          err.status = 409;
+          throw err;
+        }
+      }
 
-    const v: Vessel = {
-      id,
-      name: String(data.name || "").trim(),
-      type: data.type || "Tanker",
-      dwt: this.parseNumberLoose(data.dwt, 0),
-      status: data.status || "Planned",
-      eta: data.eta || undefined,
-      origin: data.origin || undefined,
-      destination: data.destination || undefined,
-      tender: data.tender || undefined,
-      supplier: data.supplier || undefined,
-      quantityTotal,
-      gradeAllocations,
-    };
-
-    if (!v.name) throw new Error("Vessel name is required");
-
-    this.vessels.set(id, v);
-    this.upsertVesselToSqlite(v);
-    return v;
-  }
-
-  async updateVessel(id: string, data: any) {
-    const existing = this.vessels.get(id);
-    if (!existing) throw new Error("Vessel not found");
-
-    const normalizedAllocations = this.normalizeVesselAllocations(data);
-    const hasQuantity = data.quantityTotal !== undefined || data.totalQtyMt !== undefined;
+      for (const [gradeName, used] of consumption.byGrade.entries()) {
+        const stillPlanned = nextGradeAllocations.some(
+          (p) => String(p.gradeName || "").trim().toLowerCase() === gradeName.toLowerCase()
+        );
+        if (!stillPlanned && used > 0) {
+          const err: any = new Error(
+            `Impossible de retirer ${gradeName} du plan : ${used} MT sont déjà fixés sur ce navire.`
+          );
+          err.status = 409;
+          throw err;
+        }
+      }
+    }
 
     const next: Vessel = {
       ...existing,
@@ -1292,19 +1468,35 @@ class MemStorage implements IStorage {
       destination: data.destination !== undefined ? (data.destination || undefined) : existing.destination,
       tender: data.tender !== undefined ? (data.tender || undefined) : existing.tender,
       supplier: data.supplier !== undefined ? (data.supplier || undefined) : existing.supplier,
-      quantityTotal: hasQuantity
-        ? (this.parseNumberLoose(data.quantityTotal ?? data.totalQtyMt, 0) || undefined)
-        : existing.quantityTotal,
-      gradeAllocations: normalizedAllocations !== undefined ? normalizedAllocations : existing.gradeAllocations,
+      quantityTotal: nextQuantityTotal,
+      gradeAllocations: nextGradeAllocations,
     };
 
-    if (!next.name) throw new Error("Vessel name is required");
+    if (!next.name) {
+      const err: any = new Error("Vessel name is required");
+      err.status = 400;
+      throw err;
+    }
 
     this.vessels.set(id, next);
     this.upsertVesselToSqlite(next);
     return next;
   }
+
   async deleteVessel(id: string) {
+    const vessel = this.vessels.get(id);
+    if (!vessel) return;
+
+    const hasFixings = Array.from(this.fixings.values()).some(
+      (f: any) => String(f.vessel || "").trim().toLowerCase() === String(vessel.name || "").trim().toLowerCase()
+    );
+
+    if (hasFixings) {
+      const err: any = new Error("Impossible de supprimer ce navire : des fixings y sont liés.");
+      err.status = 409;
+      throw err;
+    }
+
     this.db.prepare(`DELETE FROM vessels WHERE id = ?`).run(id);
     this.vessels.delete(id);
   }
@@ -1378,9 +1570,56 @@ class MemStorage implements IStorage {
     return next;
   }
   async deleteProduct(id: string) {
+    const used = this.db.prepare(`
+      SELECT COUNT(*) as c
+      FROM contracts
+      WHERE product_id = ?
+    `).get(id) as any;
+
+    if (Number(used?.c || 0) > 0) {
+      const err: any = new Error("Impossible de supprimer ce produit : il est utilisé dans des contrats.");
+      err.status = 409;
+      throw err;
+    }
+
     this.db.prepare(`DELETE FROM products WHERE id = ?`).run(id);
     this.products.delete(id);
   }
+
+
+
+  // ------------------- Marges cibles -------------------
+  private normalizeTargetMargin(data: InsertTargetMargin | Partial<TargetMargin>, existing?: TargetMargin): TargetMargin {
+    const market = (data.market ?? existing?.market ?? "LOCAL") === "EXPORT" ? "EXPORT" : "LOCAL";
+    const clientName = String(data.clientName ?? existing?.clientName ?? "").trim();
+    const productName = String(data.productName ?? existing?.productName ?? "").trim();
+    if (!clientName) { const err: any = new Error("Client requis pour la marge cible."); err.status = 400; throw err; }
+    if (!productName) { const err: any = new Error("Produit requis pour la marge cible."); err.status = 400; throw err; }
+    const marginTnd = data.marginTnd === null || data.marginTnd === undefined || data.marginTnd === ("" as any) ? undefined : Number(data.marginTnd);
+    const marginUsd = data.marginUsd === null || data.marginUsd === undefined || data.marginUsd === ("" as any) ? undefined : Number(data.marginUsd);
+    if (market === "LOCAL" && (marginTnd === undefined || !Number.isFinite(marginTnd))) { const err: any = new Error("M/MAT TND est requis pour le marché LOCAL."); err.status = 400; throw err; }
+    if (market === "EXPORT" && (marginUsd === undefined || !Number.isFinite(marginUsd))) { const err: any = new Error("M/MAT USD est requis pour le marché EXPORT."); err.status = 400; throw err; }
+    const id = existing?.id ?? (data.id ? String(data.id) : randomUUID());
+    return { id, market, clientId: data.clientId ?? existing?.clientId, clientName, productId: data.productId ?? existing?.productId, productName, marginTnd: market === "LOCAL" ? marginTnd : undefined, marginUsd: market === "EXPORT" ? marginUsd : undefined, updatedAt: new Date().toISOString() } as TargetMargin;
+  }
+
+  private upsertTargetMarginToSqlite(row: TargetMargin) {
+    this.db.prepare(`
+      INSERT INTO target_margins (id, market, client_id, client_name, product_id, product_name, margin_tnd, margin_usd, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET market = excluded.market, client_id = excluded.client_id, client_name = excluded.client_name, product_id = excluded.product_id, product_name = excluded.product_name, margin_tnd = excluded.margin_tnd, margin_usd = excluded.margin_usd, updated_at = excluded.updated_at
+    `).run(row.id, row.market, row.clientId ?? null, row.clientName, row.productId ?? null, row.productName, row.marginTnd ?? null, row.marginUsd ?? null, row.updatedAt);
+  }
+
+  async getAllTargetMargins() {
+    this.loadSqliteToMaps();
+    return Array.from(this.targetMargins.values()).sort((a, b) => `${a.market}-${a.clientName}-${a.productName}`.localeCompare(`${b.market}-${b.clientName}-${b.productName}`));
+  }
+  async createTargetMargin(data: InsertTargetMargin) { const row = this.normalizeTargetMargin(data); this.upsertTargetMarginToSqlite(row); this.targetMargins.set(row.id, row); return row; }
+  async updateTargetMargin(id: string, data: Partial<Omit<TargetMargin, "id" | "updatedAt">>) { const existing = this.targetMargins.get(id); if (!existing) { const err: any = new Error("Marge cible introuvable."); err.status = 404; throw err; } const row = this.normalizeTargetMargin(data, existing); this.upsertTargetMarginToSqlite(row); this.targetMargins.set(id, row); return row; }
+  async deleteTargetMargin(id: string) { this.db.prepare(`DELETE FROM target_margins WHERE id = ?`).run(id); this.targetMargins.delete(id); }
+  async replaceTargetMargins(rows: InsertTargetMargin[]) { this.db.prepare(`DELETE FROM target_margins`).run(); this.targetMargins.clear(); const saved: TargetMargin[] = []; for (const item of rows) { const row = this.normalizeTargetMargin(item); this.upsertTargetMarginToSqlite(row); this.targetMargins.set(row.id, row); saved.push(row); } return saved; }
+
 
   // ------------------- Clients -------------------
   async getAllClients() {
@@ -1417,6 +1656,18 @@ class MemStorage implements IStorage {
     return next;
   }
   async deleteClient(id: string) {
+    const used = this.db.prepare(`
+      SELECT COUNT(*) as c
+      FROM contracts
+      WHERE client_id = ?
+    `).get(id) as any;
+
+    if (Number(used?.c || 0) > 0) {
+      const err: any = new Error("Impossible de supprimer ce client : il est utilisé dans des contrats.");
+      err.status = 409;
+      throw err;
+    }
+
     this.db.prepare(`DELETE FROM clients WHERE id = ?`).run(id);
     this.clients.delete(id);
   }
@@ -1441,11 +1692,17 @@ class MemStorage implements IStorage {
       const c = this.clients.get(data.clientId);
       if (c) clientName = c.name;
     }
+    const productForSnapshot = data.productId ? this.products.get(data.productId) : undefined;
     let productName = data.productName;
-    if (!productName && data.productId) {
-      const p = this.products.get(data.productId);
-      if (p) productName = p.name;
+    if (!productName && productForSnapshot) {
+      productName = productForSnapshot.name;
     }
+
+    const productComposition: ProductComponent[] = Array.isArray((data as any).productComposition)
+      ? (data as any).productComposition
+          .map((c: any) => ({ gradeName: String(c.gradeName || "").trim(), percent: Number(c.percent) || 0 }))
+          .filter((c: any) => c.gradeName && c.percent !== 0)
+      : (productForSnapshot?.composition || []);
 
     const normalizedPriceCurrency: "USD" | "TND" = market === "LOCAL" ? "TND" : "USD";
     const normalizedPriceUsd = normalizedPriceCurrency === "USD" && data.priceUsd !== undefined
@@ -1455,7 +1712,7 @@ class MemStorage implements IStorage {
       ? Number(data.priceTnd)
       : undefined;
 
-    const c: Contract = {
+    const c: Contract = ({
       id,
       code,
       market,
@@ -1464,6 +1721,7 @@ class MemStorage implements IStorage {
       clientName: clientName || "—",
       productId: data.productId,
       productName: productName || "—",
+      productComposition,
       quantityTons: Number(data.quantityTons),
       priceCurrency: normalizedPriceCurrency,
       priceUsd: normalizedPriceUsd,
@@ -1474,16 +1732,17 @@ class MemStorage implements IStorage {
       notes: data.notes,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    };
+    } as any);
 
     this.db.prepare(`
       INSERT INTO contracts (
         id, code, market, contract_date, client_id, client_name, product_id, product_name,
-        quantity_tons, price_currency, price_usd, price_tnd, fx_rate, start_date, end_date,
+        product_composition_json, quantity_tons, price_currency, price_usd, price_tnd, fx_rate, start_date, end_date,
         notes, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       c.id, c.code, c.market, c.contractDate, c.clientId, c.clientName, c.productId, c.productName,
+      JSON.stringify((c as any).productComposition || []),
       c.quantityTons, c.priceCurrency, c.priceUsd ?? null, c.priceTnd ?? null, c.fxRate ?? null,
       c.startDate ?? null, c.endDate ?? null, c.notes ?? null, c.createdAt, c.updatedAt
     );
@@ -1503,6 +1762,15 @@ class MemStorage implements IStorage {
     const existing = this.contracts.get(id);
     if (!existing) throw new Error("Contract not found");
 
+    const existingAllocations = await this.getContractAllocations(id);
+    const hasAllocations = existingAllocations.length > 0;
+
+    if (hasAllocations && data.productId !== undefined && data.productId !== existing.productId) {
+      const err: any = new Error("Impossible de modifier le produit : ce contrat a déjà des fixings affectés.");
+      err.status = 409;
+      throw err;
+    }
+
     let nextCode = existing.code;
     let nextDate = existing.contractDate;
     let nextMarket = existing.market;
@@ -1520,13 +1788,26 @@ class MemStorage implements IStorage {
       nextCode = data.code;
     }
 
+    let nextProductName = existing.productName;
+    let nextProductComposition = (existing as any).productComposition || [];
+
+    if (!hasAllocations && data.productId !== undefined && data.productId !== existing.productId) {
+      const p = this.products.get(data.productId);
+      nextProductName = data.productName || p?.name || existing.productName;
+      nextProductComposition = p?.composition || [];
+    } else if (data.productName !== undefined) {
+      nextProductName = data.productName;
+    }
+
     const normalizedPriceCurrency: "USD" | "TND" = nextMarket === "LOCAL" ? "TND" : "USD";
-    const next: Contract = {
+    const next: Contract = ({
       ...existing,
       ...data,
       code: nextCode,
       contractDate: nextDate,
       market: nextMarket,
+      productName: nextProductName,
+      productComposition: nextProductComposition,
       quantityTons: data.quantityTons !== undefined ? Number(data.quantityTons) : existing.quantityTons,
       priceCurrency: normalizedPriceCurrency,
       priceUsd:
@@ -1539,16 +1820,41 @@ class MemStorage implements IStorage {
           : undefined,
       fxRate: data.fxRate !== undefined ? Number(data.fxRate) : existing.fxRate,
       updatedAt: new Date().toISOString(),
-    };
+    } as any);
+
+    if (hasAllocations && data.quantityTons !== undefined) {
+      const nextRequirements = await this.computeContractRequirements(next);
+      const requiredByGrade = new Map(
+        nextRequirements.map((r) => [r.gradeName.toLowerCase(), Number(r.requiredQty || 0)])
+      );
+
+      const allocatedByGrade = new Map<string, number>();
+      for (const a of existingAllocations) {
+        const key = a.gradeName.toLowerCase();
+        allocatedByGrade.set(key, (allocatedByGrade.get(key) || 0) + Number(a.allocatedQty || 0));
+      }
+
+      for (const [gradeName, allocated] of allocatedByGrade.entries()) {
+        const required = requiredByGrade.get(gradeName) || 0;
+        if (allocated > required + 1e-9) {
+          const err: any = new Error(
+            `Impossible de réduire la quantité du contrat : ${allocated} MT sont déjà affectés sur ${gradeName}.`
+          );
+          err.status = 409;
+          throw err;
+        }
+      }
+    }
 
     this.db.prepare(`
       UPDATE contracts SET
         code = ?, market = ?, contract_date = ?, client_id = ?, client_name = ?, product_id = ?, product_name = ?,
-        quantity_tons = ?, price_currency = ?, price_usd = ?, price_tnd = ?, fx_rate = ?, start_date = ?, end_date = ?,
+        product_composition_json = ?, quantity_tons = ?, price_currency = ?, price_usd = ?, price_tnd = ?, fx_rate = ?, start_date = ?, end_date = ?,
         notes = ?, updated_at = ?
       WHERE id = ?
     `).run(
       next.code, next.market, next.contractDate, next.clientId, next.clientName, next.productId, next.productName,
+      JSON.stringify((next as any).productComposition || []),
       next.quantityTons, next.priceCurrency, next.priceUsd ?? null, next.priceTnd ?? null, next.fxRate ?? null,
       next.startDate ?? null, next.endDate ?? null, next.notes ?? null, next.updatedAt, id
     );
@@ -1562,46 +1868,24 @@ class MemStorage implements IStorage {
   }
 
   async deleteContract(id: string) {
-    this.db.prepare(`DELETE FROM contract_fixing_allocations WHERE contract_id = ?`).run(id);
+    const used = this.db.prepare(`
+      SELECT COUNT(*) as c
+      FROM contract_fixing_allocations
+      WHERE contract_id = ?
+    `).get(id) as any;
+
+    if (Number(used?.c || 0) > 0) {
+      const err: any = new Error("Impossible de supprimer ce contrat : des fixings sont affectés.");
+      err.status = 409;
+      throw err;
+    }
+
     this.db.prepare(`DELETE FROM contract_requirements WHERE contract_id = ?`).run(id);
     this.db.prepare(`DELETE FROM contracts WHERE id = ?`).run(id);
     this.contracts.delete(id);
   }
 
   // ------------------- Affectations contrats / fixings -------------------
-  async getContractRequirements(contractId: string): Promise<ContractRequirement[]> {
-  this.loadSqliteToMaps();
-
-  let rows = this.db.prepare(`
-    SELECT id, contract_id, grade_name, required_qty
-    FROM contract_requirements
-    WHERE contract_id = ?
-    ORDER BY grade_name
-  `).all(contractId) as any[];
-
-  if (!rows.length) {
-    const contract = this.contracts.get(contractId);
-    if (contract) {
-      const computed = await this.computeContractRequirements(contract);
-      if (computed.length) {
-        this.replaceContractRequirements(contractId, computed);
-        rows = this.db.prepare(`
-          SELECT id, contract_id, grade_name, required_qty
-          FROM contract_requirements
-          WHERE contract_id = ?
-          ORDER BY grade_name
-        `).all(contractId) as any[];
-      }
-    }
-  }
-    return rows.map((r) => ({
-      id: r.id,
-      contractId: r.contract_id,
-      gradeName: r.grade_name,
-      requiredQty: Number(r.required_qty),
-    }));
-  }
-
   async getContractAllocations(contractId: string): Promise<ContractFixingAllocation[]> {
     const rows = this.db.prepare(`
       SELECT id, contract_id, fixing_id, grade_name, allocated_qty
@@ -1635,6 +1919,39 @@ class MemStorage implements IStorage {
     return Math.max(0, total - used);
   }
 
+async getContractRequirements(contractId: string): Promise<ContractRequirement[]> {
+  this.loadSqliteToMaps();
+
+  let rows = this.db.prepare(`
+    SELECT id, contract_id, grade_name, required_qty
+    FROM contract_requirements
+    WHERE contract_id = ?
+    ORDER BY grade_name
+  `).all(contractId) as any[];
+
+  if (!rows.length) {
+    const contract = this.contracts.get(contractId);
+    if (contract) {
+      const computed = await this.computeContractRequirements(contract);
+      if (computed.length) {
+        this.replaceContractRequirements(contractId, computed);
+        rows = this.db.prepare(`
+          SELECT id, contract_id, grade_name, required_qty
+          FROM contract_requirements
+          WHERE contract_id = ?
+          ORDER BY grade_name
+        `).all(contractId) as any[];
+      }
+    }
+  }
+
+  return rows.map((r) => ({
+    id: r.id,
+    contractId: r.contract_id,
+    gradeName: r.grade_name,
+    requiredQty: Number(r.required_qty),
+  }));
+}
 
 async allocateFixing(data: {
   contractId: string;

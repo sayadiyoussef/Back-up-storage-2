@@ -13,6 +13,7 @@ import { Pencil, Trash2, PlusCircle, RefreshCw, Search, Link2, X } from "lucide-
 type Market = "LOCAL" | "EXPORT";
 type Client = { id: string; name: string; market: Market; terms?: string; paymentTerms?: string };
 type Product = { id: string; name: string; reference?: string | null };
+type TargetMargin = { id: string; market: Market; clientId?: string; clientName: string; productId?: string; productName: string; marginTnd?: number | null; marginUsd?: number | null };
 type Fixing = {
   id: string;
   code?: string;
@@ -20,6 +21,7 @@ type Fixing = {
   grade: string;
   volume: string;
   priceUsd?: number;
+  freightUsd?: number;
   counterparty?: string;
   vessel?: string;
 };
@@ -82,6 +84,41 @@ const parseVolumeTons = (v: unknown): number => {
   if (!s) return 0;
   const cleaned = s.replace(/,/g, "").match(/-?\d+(\.\d+)?/);
   return cleaned ? Number(cleaned[0]) : 0;
+};
+
+
+const MONTH_LABELS_FR = [
+  "janvier",
+  "février",
+  "mars",
+  "avril",
+  "mai",
+  "juin",
+  "juillet",
+  "août",
+  "septembre",
+  "octobre",
+  "novembre",
+  "décembre",
+];
+
+const getYearMonthKey = (dateStr?: string) => {
+  if (!dateStr) return "";
+  const m = String(dateStr).slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return "";
+  return `${m[1]}-${m[2]}`;
+};
+
+const getYearMonthLabel = (key: string) => {
+  const [year, month] = key.split("-");
+  const idx = Number(month) - 1;
+  const label = MONTH_LABELS_FR[idx] ?? month;
+  return `${label} ${year}`;
+};
+
+const getMonthLabelFromKey = (key: string) => {
+  const month = Number(key.split("-")[1]) - 1;
+  return MONTH_LABELS_FR[month] ?? key;
 };
 
 function apiToUI(c: any): ContractUI {
@@ -163,6 +200,17 @@ export default function ContractsPage() {
   });
   const products: Product[] = useMemo(() => (productsRes as any)?.data ?? [], [productsRes]);
 
+  const { data: targetMarginsRes, refetch: refetchTargetMargins } = useQuery({
+    queryKey: ["/api/target-margins"],
+    queryFn: () => fetchJSON("/api/target-margins"),
+  });
+  const targetMargins: TargetMargin[] = useMemo(() => (targetMarginsRes as any)?.data ?? [], [targetMarginsRes]);
+  const getTargetMargin = (contract: ContractUI) => targetMargins.find((m) =>
+    m.market === contract.market &&
+    ((m.clientId && m.clientId === contract.clientId) || String(m.clientName || "").trim().toLowerCase() === String(contract.clientName || "").trim().toLowerCase()) &&
+    ((m.productId && m.productId === contract.productId) || String(m.productName || "").trim().toLowerCase() === String(contract.productName || "").trim().toLowerCase())
+  );
+
   const {
     data: fixingsRes,
     isFetching: fetchingFixings,
@@ -195,6 +243,55 @@ export default function ContractsPage() {
   const [marketFilter, setMarketFilter] = useState<Market | "ALL">("ALL");
   const [clientFilter, setClientFilter] = useState<string>("ALL");
   const [productFilter, setProductFilter] = useState<string>("ALL");
+  const [dateStartFilter, setDateStartFilter] = useState("");
+  const [dateEndFilter, setDateEndFilter] = useState("");
+  const [contractDateMonthsFilter, setContractDateMonthsFilter] = useState<string[]>([]);
+
+  const contractDateTree = useMemo(() => {
+    const tree = new Map<string, string[]>();
+
+    for (const r of rows) {
+      const key = getYearMonthKey(r.contractDate);
+      if (!key) continue;
+      const year = key.slice(0, 4);
+      const existing = tree.get(year) ?? [];
+      if (!existing.includes(key)) existing.push(key);
+      tree.set(year, existing);
+    }
+
+    return Array.from(tree.entries())
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .map(([year, months]) => ({
+        year,
+        months: months.sort((a, b) => a.localeCompare(b)),
+      }));
+  }, [rows]);
+
+  const selectedContractMonthSet = useMemo(
+    () => new Set(contractDateMonthsFilter),
+    [contractDateMonthsFilter]
+  );
+
+  const toggleContractMonth = (key: string, checked: boolean) => {
+    setContractDateMonthsFilter((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(key);
+      else next.delete(key);
+      return Array.from(next).sort();
+    });
+  };
+
+  const toggleContractYear = (year: string, checked: boolean) => {
+    const yearMonths = contractDateTree.find((item) => item.year === year)?.months ?? [];
+    setContractDateMonthsFilter((prev) => {
+      const next = new Set(prev);
+      for (const key of yearMonths) {
+        if (checked) next.add(key);
+        else next.delete(key);
+      }
+      return Array.from(next).sort();
+    });
+  };
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -202,6 +299,12 @@ export default function ContractsPage() {
       if (marketFilter !== "ALL" && r.market !== marketFilter) return false;
       if (clientFilter !== "ALL" && r.clientId !== clientFilter) return false;
       if (productFilter !== "ALL" && r.productId !== productFilter) return false;
+      if (dateStartFilter && r.dateStart !== dateStartFilter) return false;
+      if (dateEndFilter && r.dateEnd !== dateEndFilter) return false;
+      if (selectedContractMonthSet.size > 0) {
+        const key = getYearMonthKey(r.contractDate);
+        if (!key || !selectedContractMonthSet.has(key)) return false;
+      }
       if (!needle) return true;
       return (
         (r.code || "").toLowerCase().includes(needle) ||
@@ -209,7 +312,7 @@ export default function ContractsPage() {
         (r.productName || "").toLowerCase().includes(needle)
       );
     });
-  }, [rows, q, marketFilter, clientFilter, productFilter]);
+  }, [rows, q, marketFilter, clientFilter, productFilter, dateStartFilter, dateEndFilter, selectedContractMonthSet]);
 
   const totalQuantity = useMemo(() => {
     return filtered.reduce((sum, r) => sum + (Number(r.quantityT) || 0), 0);
@@ -302,6 +405,116 @@ export default function ContractsPage() {
   });
   const coverageMap = (coverageMapQuery.data ?? {}) as Record<string, number>;
 
+  const materialMarginQuery = useQuery({
+    queryKey: [
+      "/api/contracts-material-margin-map",
+      rows
+        .map((r) =>
+          [
+            r.id,
+            r.market,
+            r.quantityT,
+            r.pricePerT,
+            r.priceCurrency,
+            r.fxRate,
+            r.updatedAt,
+          ].join(":")
+        )
+        .join("|"),
+      fixings
+        .map((f) =>
+          [
+            f.id,
+            f.priceUsd ?? 0,
+            f.freightUsd ?? 0,
+            f.volume,
+          ].join(":")
+        )
+        .join("|"),
+    ],
+    queryFn: async () => {
+      const fixingById = new Map(fixings.map((f) => [f.id, f]));
+
+      const entries = await Promise.all(
+        rows
+          .filter((r) => r.id)
+          .map(async (r) => {
+            try {
+              const [requirementsRes, allocationsRes] = await Promise.all([
+                fetchJSON(`/api/contracts/${r.id}/requirements`),
+                fetchJSON(`/api/contracts/${r.id}/allocations`),
+              ]);
+
+              const reqs: ContractRequirement[] = requirementsRes?.data ?? [];
+              const allocs: ContractAllocation[] = allocationsRes?.data ?? [];
+              const contractQty = Number(r.quantityT) || 0;
+
+              if (!contractQty || reqs.length === 0 || allocs.length === 0) {
+                return [r.id!, { margin: null, materialCostUsd: null, allocated: false }] as const;
+              }
+
+              let materialCostUsd = 30;
+              let hasAllocatedMaterial = false;
+
+              for (const req of reqs) {
+                const gradeKey = String(req.gradeName || "").trim().toLowerCase();
+                const gradePercent = (Number(req.requiredQty) || 0) / contractQty;
+                const gradeAllocs = allocs.filter(
+                  (a) => String(a.gradeName || "").trim().toLowerCase() === gradeKey
+                );
+
+                const allocatedQty = gradeAllocs.reduce((sum, a) => sum + (Number(a.allocatedQty) || 0), 0);
+                if (!allocatedQty || gradePercent <= 0) continue;
+
+                const weightedMaterialUsd =
+                  gradeAllocs.reduce((sum, a) => {
+                    const fixing = fixingById.get(a.fixingId);
+                    const priceUsd = Number(fixing?.priceUsd) || 0;
+                    const freightUsd = Number(fixing?.freightUsd) || 0;
+                    return sum + (priceUsd + freightUsd) * (Number(a.allocatedQty) || 0);
+                  }, 0) / allocatedQty;
+
+                if (Number.isFinite(weightedMaterialUsd) && weightedMaterialUsd > 0) {
+                  materialCostUsd += weightedMaterialUsd * gradePercent;
+                  hasAllocatedMaterial = true;
+                }
+              }
+
+              if (!hasAllocatedMaterial) {
+                return [r.id!, { margin: null, materialCostUsd: null, allocated: false }] as const;
+              }
+
+              const salePrice = Number(r.pricePerT) || 0;
+              const fxRate = Number(r.fxRate) || 0;
+              const margin =
+                r.market === "LOCAL"
+                  ? salePrice - materialCostUsd * fxRate
+                  : salePrice - materialCostUsd;
+
+              return [
+                r.id!,
+                {
+                  margin,
+                  materialCostUsd,
+                  allocated: true,
+                },
+              ] as const;
+            } catch {
+              return [r.id!, { margin: null, materialCostUsd: null, allocated: false }] as const;
+            }
+          })
+      );
+
+      return Object.fromEntries(entries);
+    },
+    enabled: rows.length > 0,
+  });
+
+  const materialMarginMap = (materialMarginQuery.data ?? {}) as Record<
+    string,
+    { margin: number | null; materialCostUsd: number | null; allocated: boolean }
+  >;
+
   const allocationsByGrade = useMemo(() => {
     const m = new Map<string, ContractAllocation[]>();
     allocations.forEach((a) => {
@@ -333,7 +546,7 @@ export default function ContractsPage() {
         body: JSON.stringify(body),
       });
     },
-    onSuccess: (res: any) => {
+    onSuccess: async (res: any) => {
       const saved = apiToUI(res?.data);
       qc.setQueryData(["/api/contracts"], (prev: any) => {
         const prevArr: ContractUI[] = (prev?.data ?? []).map(apiToUI);
@@ -344,7 +557,17 @@ export default function ContractsPage() {
         }
         return { data: [saved, ...prevArr] };
       });
-      qc.invalidateQueries({ queryKey: ["/api/contracts"] });
+
+      await qc.invalidateQueries({ queryKey: ["/api/contracts"] });
+      await qc.invalidateQueries({ queryKey: ["/api/target-margins"] });
+      await qc.invalidateQueries({ queryKey: ["/api/contracts-material-margin-map"] });
+      await qc.invalidateQueries({ queryKey: ["/api/contracts-coverage-map"] });
+
+      await refetchContracts();
+      await refetchTargetMargins();
+      await materialMarginQuery.refetch();
+      await coverageMapQuery.refetch();
+
       setOpen(false);
       setEditingId(null);
       resetForm();
@@ -393,6 +616,7 @@ export default function ContractsPage() {
         refetchFixings(),
       ]);
       await coverageMapQuery.refetch();
+      await materialMarginQuery.refetch();
       setDraftQtyByGrade((prev) => ({ ...prev, [vars.gradeName]: "" }));
     },
     onError: (e: any) => {
@@ -411,6 +635,7 @@ export default function ContractsPage() {
         refetchFixings(),
       ]);
       await coverageMapQuery.refetch();
+      await materialMarginQuery.refetch();
     },
     onError: (e: any) => {
       alert(`Erreur suppression affectation:\n${e?.message || e}`);
@@ -462,12 +687,24 @@ export default function ContractsPage() {
       .sort((a, b) => (b.available || 0) - (a.available || 0));
   };
 
+  const clearFilters = () => {
+    setQ("");
+    setMarketFilter("ALL");
+    setClientFilter("ALL");
+    setProductFilter("ALL");
+    setDateStartFilter("");
+    setDateEndFilter("");
+    setContractDateMonthsFilter([]);
+  };
+
   const doRefresh = () => {
     refetchClients();
     refetchProducts();
     refetchContracts();
     refetchFixings();
+    refetchTargetMargins();
     coverageMapQuery.refetch();
+    materialMarginQuery.refetch();
   };
 
   const coverageBadge = (v: number) => {
@@ -490,48 +727,12 @@ export default function ContractsPage() {
               )}
             </div>
             <div className="flex items-center gap-2">
-              <div className="hidden md:flex items-center bg-gray-900 border border-gray-700 rounded-md px-2">
-                <Search className="h-4 w-4 text-gray-400" />
-                <input
-                  className="bg-transparent outline-none px-2 py-1 text-sm placeholder:text-gray-500"
-                  placeholder="Rechercher code, client, produit…"
-                  value={q}
-                  onChange={(e) => setQ(e.target.value)}
-                />
-              </div>
-              <select
-                className="h-9 rounded-md bg-gray-900 border border-gray-700 text-white px-3"
-                value={marketFilter}
-                onChange={(e) => setMarketFilter(e.target.value as any)}
-              >
-                <option value="ALL">Tous marchés</option>
-                <option value="LOCAL">LOCAL</option>
-                <option value="EXPORT">EXPORT</option>
-              </select>
-              <select
-                className="h-9 rounded-md bg-gray-900 border border-gray-700 text-white px-3"
-                value={clientFilter}
-                onChange={(e) => setClientFilter(e.target.value)}
-              >
-                <option value="ALL">Tous clients</option>
-                {clients.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="h-9 rounded-md bg-gray-900 border border-gray-700 text-white px-3"
-                value={productFilter}
-                onChange={(e) => setProductFilter(e.target.value)}
-              >
-                <option value="ALL">Tous produits</option>
-                {products.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
+              {(q || marketFilter !== "ALL" || clientFilter !== "ALL" || productFilter !== "ALL" || dateStartFilter || dateEndFilter || contractDateMonthsFilter.length > 0) && (
+                <Button variant="outline" className="border-gray-600 text-white" onClick={clearFilters}>
+                  <X className="h-4 w-4 mr-2" />
+                  Effacer filtres
+                </Button>
+              )}
               <Button variant="outline" className="border-gray-600 text-white" onClick={doRefresh}>
                 <RefreshCw className="h-4 w-4 mr-2" />
                 Rafraîchir
@@ -556,30 +757,196 @@ export default function ContractsPage() {
                 <div className="p-4 text-gray-300">Chargement…</div>
               ) : error ? (
                 <div className="p-4 text-red-400">Erreur de chargement</div>
-              ) : filtered.length === 0 ? (
-                <div className="p-4 text-gray-300">Aucun contrat.</div>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-sm">
                     <thead className="text-gray-300 bg-black/20">
-                      <tr className="text-left">
-                        <th className="py-2 px-3">Code</th>
-                        <th className="py-2 px-3">Marché</th>
-                        <th className="py-2 px-3">Client</th>
-                        <th className="py-2 px-3">Produit</th>
+                      <tr className="text-left align-top">
+                        <th className="py-2 px-3 min-w-[160px]">
+                          <div className="space-y-1">
+                            <div>Code</div>
+                            <div className="flex items-center bg-gray-900 border border-gray-700 rounded-md px-2">
+                              <Search className="h-3 w-3 text-gray-400" />
+                              <input
+                                className="w-full bg-transparent outline-none px-2 py-1 text-xs placeholder:text-gray-500"
+                                placeholder="Filtrer…"
+                                value={q}
+                                onChange={(e) => setQ(e.target.value)}
+                              />
+                            </div>
+                          </div>
+                        </th>
+                        <th className="py-2 px-3 min-w-[120px]">
+                          <div className="space-y-1">
+                            <div>Marché</div>
+                            <select
+                              className="w-full h-8 rounded-md bg-gray-900 border border-gray-700 text-white px-2 text-xs"
+                              value={marketFilter}
+                              onChange={(e) => setMarketFilter(e.target.value as any)}
+                            >
+                              <option value="ALL">Tous</option>
+                              <option value="LOCAL">LOCAL</option>
+                              <option value="EXPORT">EXPORT</option>
+                            </select>
+                          </div>
+                        </th>
+                        <th className="py-2 px-3 min-w-[170px]">
+                          <div className="space-y-1">
+                            <div>Client</div>
+                            <select
+                              className="w-full h-8 rounded-md bg-gray-900 border border-gray-700 text-white px-2 text-xs"
+                              value={clientFilter}
+                              onChange={(e) => setClientFilter(e.target.value)}
+                            >
+                              <option value="ALL">Tous</option>
+                              {clients.map((c) => (
+                                <option key={c.id} value={c.id}>
+                                  {c.name}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </th>
+                        <th className="py-2 px-3 min-w-[190px]">
+                          <div className="space-y-1">
+                            <div>Produit</div>
+                            <select
+                              className="w-full h-8 rounded-md bg-gray-900 border border-gray-700 text-white px-2 text-xs"
+                              value={productFilter}
+                              onChange={(e) => setProductFilter(e.target.value)}
+                            >
+                              <option value="ALL">Tous</option>
+                              {products.map((p) => (
+                                <option key={p.id} value={p.id}>
+                                  {p.name}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </th>
                         <th className="py-2 px-3">Qté (T)</th>
                         <th className="py-2 px-3">Prix/T</th>
                         <th className="py-2 px-3">FX</th>
                         <th className="py-2 px-3">Couverture</th>
-                        <th className="py-2 px-3">Début</th>
-                        <th className="py-2 px-3">Fin</th>
-                        <th className="py-2 px-3">Date contrat</th>
+                        <th className="py-2 px-3 min-w-[150px]">Marge matière</th>
+                        <th className="py-2 px-3 min-w-[140px]">Marge cible</th>
+                        <th className="py-2 px-3 min-w-[120px]">Écart</th>
+                        <th className="py-2 px-3 min-w-[150px]">
+                          <div className="space-y-1">
+                            <div>Début</div>
+                            <input
+                              type="date"
+                              className="w-full h-8 rounded-md bg-gray-900 border border-gray-700 text-white px-2 text-xs"
+                              value={dateStartFilter}
+                              onChange={(e) => setDateStartFilter(e.target.value)}
+                            />
+                          </div>
+                        </th>
+                        <th className="py-2 px-3 min-w-[150px]">
+                          <div className="space-y-1">
+                            <div>Fin</div>
+                            <input
+                              type="date"
+                              className="w-full h-8 rounded-md bg-gray-900 border border-gray-700 text-white px-2 text-xs"
+                              value={dateEndFilter}
+                              onChange={(e) => setDateEndFilter(e.target.value)}
+                            />
+                          </div>
+                        </th>
+                        <th className="py-2 px-3 min-w-[220px]">
+                          <div className="space-y-1">
+                            <div>Date contrat</div>
+                            <details className="relative group">
+                              <summary className="list-none cursor-pointer h-8 rounded-md bg-gray-900 border border-gray-700 text-white px-2 text-xs flex items-center justify-between">
+                                <span className="truncate">
+                                  {contractDateMonthsFilter.length === 0
+                                    ? "Tous"
+                                    : contractDateMonthsFilter.length === 1
+                                      ? getYearMonthLabel(contractDateMonthsFilter[0])
+                                      : `${contractDateMonthsFilter.length} mois sélectionnés`}
+                                </span>
+                                <span className="text-gray-400">▾</span>
+                              </summary>
+                              <div className="absolute z-30 mt-1 w-64 max-h-80 overflow-y-auto rounded-md border border-gray-700 bg-gray-950 p-2 shadow-xl">
+                                <div className="flex items-center justify-between border-b border-gray-800 pb-2 mb-2">
+                                  <button
+                                    type="button"
+                                    className="text-xs text-trading-blue hover:underline"
+                                    onClick={() => {
+                                      const allMonths = contractDateTree.flatMap((item) => item.months);
+                                      setContractDateMonthsFilter(allMonths);
+                                    }}
+                                  >
+                                    Tout sélectionner
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="text-xs text-gray-300 hover:underline"
+                                    onClick={() => setContractDateMonthsFilter([])}
+                                  >
+                                    Effacer
+                                  </button>
+                                </div>
+
+                                {contractDateTree.length === 0 ? (
+                                  <div className="px-1 py-2 text-xs text-gray-400">Aucune date</div>
+                                ) : (
+                                  contractDateTree.map(({ year, months }) => {
+                                    const selectedCount = months.filter((key) => selectedContractMonthSet.has(key)).length;
+                                    const yearChecked = selectedCount === months.length && months.length > 0;
+                                    const yearIndeterminate = selectedCount > 0 && selectedCount < months.length;
+
+                                    return (
+                                      <div key={year} className="mb-2">
+                                        <label className="flex items-center gap-2 text-xs font-semibold text-white">
+                                          <input
+                                            type="checkbox"
+                                            checked={yearChecked}
+                                            ref={(el) => {
+                                              if (el) el.indeterminate = yearIndeterminate;
+                                            }}
+                                            onChange={(e) => toggleContractYear(year, e.target.checked)}
+                                          />
+                                          {year}
+                                        </label>
+                                        <div className="ml-5 mt-1 space-y-1">
+                                          {months.map((key) => (
+                                            <label key={key} className="flex items-center gap-2 text-xs text-gray-200">
+                                              <input
+                                                type="checkbox"
+                                                checked={selectedContractMonthSet.has(key)}
+                                                onChange={(e) => toggleContractMonth(key, e.target.checked)}
+                                              />
+                                              {getMonthLabelFromKey(key)}
+                                            </label>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    );
+                                  })
+                                )}
+                              </div>
+                            </details>
+                          </div>
+                        </th>
                         <th className="py-2 px-3">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="text-gray-200">
+                      {filtered.length === 0 && (
+                        <tr>
+                          <td className="py-4 px-3 text-gray-300" colSpan={15}>
+                            Aucun contrat ne correspond aux filtres.
+                          </td>
+                        </tr>
+                      )}
                       {filtered.map((r) => {
                         const cov = r.id ? Number(coverageMap[r.id] ?? 0) : 0;
+                        const marginInfo = r.id ? materialMarginMap[r.id] : undefined;
+                        const marginCurrency = r.market === "LOCAL" ? "TND/T" : "USD/T";
+                        const targetMargin = getTargetMargin(r);
+                        const targetValue = r.market === "LOCAL" ? targetMargin?.marginTnd : targetMargin?.marginUsd;
+                        const delta = marginInfo?.margin != null && targetValue != null ? marginInfo.margin - Number(targetValue) : null;
                         return (
                           <tr key={r.id} className="border-t border-gray-700">
                             <td className="py-2 px-3">{r.code || "—"}</td>
@@ -605,6 +972,38 @@ export default function ContractsPage() {
                               <span className={`text-xs px-2 py-1 rounded-full border ${coverageBadge(cov)}`}>
                                 {(cov * 100).toFixed(0)}%
                               </span>
+                            </td>
+                            <td
+                              className="py-2 px-3"
+                              title={
+                                marginInfo?.materialCostUsd != null
+                                  ? `Coût matière: ${marginInfo.materialCostUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })} USD/T`
+                                  : "Aucune matière affectée"
+                              }
+                            >
+                              {marginInfo?.margin == null ? (
+                                <span className="text-gray-500">—</span>
+                              ) : (
+                                <span className={marginInfo.margin >= 0 ? "text-emerald-300" : "text-red-300"}>
+                                  {marginInfo.margin.toLocaleString(undefined, { maximumFractionDigits: 2 })} {marginCurrency}
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3">
+                              {targetValue == null ? (
+                                <span className="text-gray-500">—</span>
+                              ) : (
+                                <span>{Number(targetValue).toLocaleString(undefined, { maximumFractionDigits: 2 })} {marginCurrency}</span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3">
+                              {delta == null ? (
+                                <span className="text-gray-500">—</span>
+                              ) : (
+                                <span className={delta >= 0 ? "text-emerald-300" : "text-red-300"}>
+                                  {delta.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                                </span>
+                              )}
                             </td>
                             <td className="py-2 px-3">{r.dateStart}</td>
                             <td className="py-2 px-3">{r.dateEnd}</td>
@@ -657,7 +1056,7 @@ export default function ContractsPage() {
                       <tr className="border-t border-gray-600 bg-black/20 font-semibold text-white">
                         <td className="py-2 px-3" colSpan={4}>Total</td>
                         <td className="py-2 px-3">{totalQuantity.toLocaleString()} T</td>
-                        <td className="py-2 px-3" colSpan={7}></td>
+                        <td className="py-2 px-3" colSpan={10}></td>
                       </tr>
                     </tbody>
                   </table>

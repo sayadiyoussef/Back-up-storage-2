@@ -115,6 +115,7 @@ export const productSchema = insertProductSchema.extend({
   id: z.string(),
   updatedAt: z.string(),
 });
+export type ProductComponent = z.infer<typeof productComponentSchema>;
 export type InsertProduct = z.infer<typeof insertProductSchema>;
 export type Product = z.infer<typeof productSchema>;
 
@@ -206,6 +207,10 @@ export const insertContractInputSchema = z.object({
   productId: z.string(),
   productName: z.string().optional(),
 
+  // Snapshot composition produit au moment de la création du contrat.
+  // Les anciens contrats restent compatibles si ce champ n'existe pas encore.
+  productComposition: z.array(productComponentSchema).optional(),
+
   // ancien/nouveau alias
   quantityTons: z.number().positive().optional(),
   quantityT: z.number().positive().optional(),
@@ -244,6 +249,7 @@ export const insertContractSchema = insertContractInputSchema
       priceCurrency,
       startDate,
       endDate,
+      productComposition: v.productComposition ?? undefined,
     };
   })
   .superRefine((v, ctx) => {
@@ -273,6 +279,10 @@ export const contractSchema = z.object({
   productId: z.string(),
   productName: z.string().optional(),
 
+  // Snapshot figé de la composition au moment de la création du contrat.
+  // Sert aux besoins matière et aux marges sans être impacté par les modifications futures du produit.
+  productComposition: z.array(productComponentSchema).optional(),
+
   // on tolère quantityT ou quantityTons selon le storage
   quantityT: z.number().positive().optional(),
   quantityTons: z.number().positive().optional(),
@@ -292,3 +302,34 @@ export const contractSchema = z.object({
 
 export type InsertContract = z.infer<typeof insertContractSchema>;
 export type Contract       = z.infer<typeof contractSchema>;
+
+
+/* ===========================
+   TARGET MARGINS / MARGES CIBLES
+   =========================== */
+export const targetMarginSchema = z.object({
+  id: z.string(),
+  market: marketEnum,
+  clientId: z.string().optional(),
+  clientName: z.string().min(1),
+  productId: z.string().optional(),
+  productName: z.string().min(1),
+  marginTnd: z.number().nullable().optional(),
+  marginUsd: z.number().nullable().optional(),
+  updatedAt: z.string(),
+});
+
+export const insertTargetMarginSchema = z.object({
+  id: z.string().optional(),
+  market: marketEnum,
+  clientId: z.string().optional(),
+  clientName: z.string().min(1),
+  productId: z.string().optional(),
+  productName: z.string().min(1),
+  marginTnd: z.number().nullable().optional(),
+  marginUsd: z.number().nullable().optional(),
+  updatedAt: z.string().optional(),
+});
+
+export type TargetMargin = z.infer<typeof targetMarginSchema>;
+export type InsertTargetMargin = z.infer<typeof insertTargetMarginSchema>;

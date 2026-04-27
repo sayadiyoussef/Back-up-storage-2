@@ -1,16 +1,23 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import Sidebar from "@/components/sidebar";
 import TopBar from "@/components/topbar";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Pencil, Copy, Trash2, Calendar as CalendarIcon, ChevronLeft, ChevronRight, PlusCircle, X } from "lucide-react";
+import { Pencil, Copy, Trash2, PlusCircle, X, CalendarDays } from "lucide-react";
 
 /* ------------------- Types ------------------- */
 type OilGrade = { id: number; name: string };
 type GradeAllocation = { gradeId?: number; gradeName: string; qty: number };
+type Fixing = {
+  id?: string;
+  vessel?: string;
+  grade?: string;
+  volume?: number | string;
+};
+
 type Vessel = {
   id?: string;
   name: string;
@@ -36,6 +43,13 @@ const fetchJSON = async (url: string, init?: RequestInit) => {
   return t ? JSON.parse(t) : null;
 };
 
+const formatDateFr = (value?: string) => {
+  if (!value) return "";
+  const [year, month, day] = String(value).slice(0, 10).split("-");
+  if (!year || !month || !day) return String(value);
+  return day + "/" + month + "/" + year;
+};
+
 const toNumber = (v: any) => {
   if (typeof v === "number") return v;
   if (typeof v === "string") {
@@ -47,10 +61,77 @@ const toNumber = (v: any) => {
 
 export default function Navires() {
   const qc = useQueryClient();
+  const etaInputRef = useRef<HTMLInputElement | null>(null);
 
   /* --------- Data --------- */
   const { data: vesselsRes } = useQuery({ queryKey: ["/api/vessels"], queryFn: () => fetchJSON("/api/vessels") });
   const rows: Vessel[] = useMemo(() => (vesselsRes as any)?.data ?? [], [vesselsRes]);
+
+  const { data: fixingsRes } = useQuery({ queryKey: ["/api/fixings"], queryFn: () => fetchJSON("/api/fixings") });
+  const fixings: Fixing[] = useMemo(() => (fixingsRes as any)?.data ?? [], [fixingsRes]);
+
+  const vesselRemainingById = useMemo(() => {
+    const result = new Map<string, Array<{ gradeName: string; plannedQty: number; fixedQty: number; remainingQty: number }>>();
+
+    for (const vessel of rows) {
+      const planned = new Map<string, { gradeName: string; qty: number }>();
+      for (const allocation of vessel.gradeAllocations || []) {
+        const gradeName = String(allocation.gradeName || "").trim();
+        if (!gradeName) continue;
+        const key = gradeName.toLowerCase();
+        const current = planned.get(key);
+        planned.set(key, {
+          gradeName,
+          qty: (current?.qty || 0) + toNumber(allocation.qty),
+        });
+      }
+
+      const fixed = new Map<string, number>();
+      const vesselName = String(vessel.name || "").trim().toLowerCase();
+      for (const fixing of fixings) {
+        if (String(fixing.vessel || "").trim().toLowerCase() !== vesselName) continue;
+        const gradeName = String(fixing.grade || "").trim();
+        if (!gradeName) continue;
+        const key = gradeName.toLowerCase();
+        fixed.set(key, (fixed.get(key) || 0) + toNumber(fixing.volume));
+      }
+
+      const remaining = Array.from(planned.entries()).map(([key, value]) => {
+        const fixedQty = fixed.get(key) || 0;
+        return {
+          gradeName: value.gradeName,
+          plannedQty: value.qty,
+          fixedQty,
+          remainingQty: Math.max(0, value.qty - fixedQty),
+        };
+      });
+
+      if (vessel.id) result.set(vessel.id, remaining);
+    }
+
+    return result;
+  }, [rows, fixings]);
+
+  const tenderGroups = useMemo(() => {
+    const sorted = [...rows].sort((a: any, b: any) => {
+      const tenderCmp = String(a.tender || "Sans tender").localeCompare(String(b.tender || "Sans tender"));
+      if (tenderCmp !== 0) return tenderCmp;
+
+      const dateA = a.eta ? new Date(a.eta).getTime() : Number.POSITIVE_INFINITY;
+      const dateB = b.eta ? new Date(b.eta).getTime() : Number.POSITIVE_INFINITY;
+      if (dateA !== dateB) return dateA - dateB;
+
+      return String(a.name || "").localeCompare(String(b.name || ""));
+    });
+
+    const groups = new Map<string, Vessel[]>();
+    for (const vessel of sorted) {
+      const key = String((vessel as any).tender || "").trim() || "Sans tender";
+      groups.set(key, [...(groups.get(key) || []), vessel]);
+    }
+
+    return Array.from(groups.entries()).map(([tender, vessels]) => ({ tender, vessels }));
+  }, [rows]);
 
   const { data: gradesRes } = useQuery({ queryKey: ["/api/grades"], queryFn: () => fetchJSON("/api/grades") });
   const grades: OilGrade[] = useMemo(() => (gradesRes as any)?.data ?? [], [gradesRes]);
@@ -215,111 +296,148 @@ export default function Navires() {
             </Button>
           </div>
 
-          <Card className="bg-trading-slate border-gray-700">
-            <CardContent>
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-sm">
-                  <thead className="text-gray-300">
-                    <tr className="text-left">
-                      <th className="py-2 px-3">Name</th>
-                      <th className="py-2 px-3">Tender</th>
-                      <th className="py-2 px-3">Supplier</th>
-                      <th className="py-2 px-3">Qty (MT)</th>
-                      <th className="py-2 px-3">Status</th>
-                      <th className="py-2 px-3">ETA</th>
-                      <th className="py-2 px-3">Destination</th>
-                      <th className="py-2 px-3">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="text-gray-200">
-                    {rows.map((r: any) => (
-                      <tr key={r.id} className="border-t border-gray-700">
-                        <td className="py-2 px-3">{r.name}</td>
-                        <td className="py-2 px-3">{r.tender || "—"}</td>
-                        <td className="py-2 px-3">{r.supplier || "—"}</td>
-                        <td className="py-2 px-3">{r.quantityTotal ?? "—"}</td>
-                        <td className="py-2 px-3">{r.status}</td>
-                        <td className="py-2 px-3">{r.eta || "—"}</td>
-                        <td className="py-2 px-3">{r.destination || "—"}</td>
-                        <td className="py-2 px-3">
-                          <div className="flex items-center gap-2">
-                            {/* Modifier */}
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              title="Modifier"
-                              onClick={() => {
-                                setEditingId(r.id);
-                                setForm({
-                                  id: r.id,
-                                  name: r.name ?? "",
-                                  type: r.type ?? "Tanker",
-                                  dwt: r.dwt ?? "",
-                                  status: r.status ?? "Unknown",
-                                  eta: r.eta ?? "",
-                                  origin: r.origin ?? "",
-                                  destination: r.destination ?? "",
-                                  tender: r.tender ?? "",
-                                  supplier: r.supplier ?? "",
-                                  quantityTotal: r.quantityTotal ?? "",
-                                  gradeAllocations: Array.isArray(r.gradeAllocations) ? r.gradeAllocations : [],
-                                });
-                                setOpen(true);
-                              }}
-                            >
-                              <Pencil className="h-4 w-4" />
-                            </Button>
+          <div className="space-y-4">
+            {tenderGroups.length === 0 ? (
+              <Card className="bg-trading-slate border-gray-700">
+                <CardContent className="py-6 text-gray-400">Aucun navire enregistré.</CardContent>
+              </Card>
+            ) : (
+              tenderGroups.map((group) => (
+                <Card key={group.tender} className="bg-trading-slate border-gray-700">
+                  <CardContent>
+                    <div className="flex items-center justify-between py-3 border-b border-gray-700">
+                      <div>
+                        <h3 className="text-lg font-semibold text-white">{group.tender}</h3>
+                        <div className="text-xs text-gray-400">
+                          {group.vessels.length} navire{group.vessels.length > 1 ? "s" : ""} — classés par ETA
+                        </div>
+                      </div>
+                    </div>
 
-                            {/* Dupliquer */}
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              title="Dupliquer"
-                              onClick={() => {
-                                setEditingId(null); // force POST
-                                setForm({
-                                  id: undefined,
-                                  name: r.name ?? "",
-                                  type: r.type ?? "Tanker",
-                                  dwt: r.dwt ?? "",
-                                  status: r.status ?? "Unknown",
-                                  eta: r.eta ?? "",
-                                  origin: r.origin ?? "",
-                                  destination: r.destination ?? "",
-                                  tender: r.tender ?? "",
-                                  supplier: r.supplier ?? "",
-                                  quantityTotal: r.quantityTotal ?? "",
-                                  gradeAllocations: Array.isArray(r.gradeAllocations) ? r.gradeAllocations : [],
-                                });
-                                setOpen(true);
-                              }}
-                            >
-                              <Copy className="h-4 w-4" />
-                            </Button>
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full text-sm">
+                        <thead className="text-gray-300">
+                          <tr className="text-left">
+                            <th className="py-2 px-3">Name</th>
+                            <th className="py-2 px-3">Supplier</th>
+                            <th className="py-2 px-3">Qty (MT)</th>
+                            <th className="py-2 px-3">Reste à fixer</th>
+                            <th className="py-2 px-3">Status</th>
+                            <th className="py-2 px-3">ETA</th>
+                            <th className="py-2 px-3">Destination</th>
+                            <th className="py-2 px-3">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="text-gray-200">
+                          {group.vessels.map((r: any) => {
+                            const remainingRows = r.id ? vesselRemainingById.get(r.id) || [] : [];
+                            const hasRemainingInfo = remainingRows.length > 0;
 
-                            {/* Supprimer */}
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              title="Supprimer"
-                              onClick={() => {
-                                if (!r.id) return;
-                                if (confirm(`Supprimer le navire "${r.name}" ?`)) {
-                                  delVessel.mutate(r.id);
-                                }
-                              }}
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </CardContent>
-          </Card>
+                            return (
+                              <tr key={r.id} className="border-t border-gray-700 align-top">
+                                <td className="py-2 px-3">{r.name}</td>
+                                <td className="py-2 px-3">{r.supplier || "—"}</td>
+                                <td className="py-2 px-3">{r.quantityTotal ?? "—"}</td>
+                                <td className="py-2 px-3">
+                                  {hasRemainingInfo ? (
+                                    <div className="space-y-1">
+                                      {remainingRows.map((item) => (
+                                        <div
+                                          key={item.gradeName}
+                                          className={item.remainingQty > 0 ? "text-amber-300" : "text-green-400"}
+                                          title={`Planifié: ${item.plannedQty.toLocaleString()} MT | Fixé: ${item.fixedQty.toLocaleString()} MT`}
+                                        >
+                                          {item.remainingQty.toLocaleString()} MT {item.gradeName}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <span className="text-gray-500">—</span>
+                                  )}
+                                </td>
+                                <td className="py-2 px-3">{r.status}</td>
+                              <td className="py-2 px-3">{r.eta || "—"}</td>
+                              <td className="py-2 px-3">{r.destination || "—"}</td>
+                              <td className="py-2 px-3">
+                                <div className="flex items-center gap-2">
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    title="Modifier"
+                                    onClick={() => {
+                                      setEditingId(r.id);
+                                      setForm({
+                                        id: r.id,
+                                        name: r.name ?? "",
+                                        type: r.type ?? "Tanker",
+                                        dwt: r.dwt ?? "",
+                                        status: r.status ?? "Unknown",
+                                        eta: r.eta ?? "",
+                                        origin: r.origin ?? "",
+                                        destination: r.destination ?? "",
+                                        tender: r.tender ?? "",
+                                        supplier: r.supplier ?? "",
+                                        quantityTotal: r.quantityTotal ?? "",
+                                        gradeAllocations: Array.isArray(r.gradeAllocations) ? r.gradeAllocations : [],
+                                      });
+                                      setOpen(true);
+                                    }}
+                                  >
+                                    <Pencil className="h-4 w-4" />
+                                  </Button>
+
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    title="Dupliquer"
+                                    onClick={() => {
+                                      setEditingId(null);
+                                      setForm({
+                                        id: undefined,
+                                        name: r.name ?? "",
+                                        type: r.type ?? "Tanker",
+                                        dwt: r.dwt ?? "",
+                                        status: r.status ?? "Unknown",
+                                        eta: r.eta ?? "",
+                                        origin: r.origin ?? "",
+                                        destination: r.destination ?? "",
+                                        tender: r.tender ?? "",
+                                        supplier: r.supplier ?? "",
+                                        quantityTotal: r.quantityTotal ?? "",
+                                        gradeAllocations: Array.isArray(r.gradeAllocations) ? r.gradeAllocations : [],
+                                      });
+                                      setOpen(true);
+                                    }}
+                                  >
+                                    <Copy className="h-4 w-4" />
+                                  </Button>
+
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    title="Supprimer"
+                                    onClick={() => {
+                                      if (!r.id) return;
+                                      if (confirm(`Supprimer le navire "${r.name}" ?`)) {
+                                        delVessel.mutate(r.id);
+                                      }
+                                    }}
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </Button>
+                                </div>
+                              </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </CardContent>
+                </Card>
+              ))
+            )}
+          </div>
         </main>
       </div>
 
@@ -364,34 +482,48 @@ export default function Navires() {
               </div>
 
               {/* ETA */}
-              <div className="relative">
+              <div>
                 <Label className="text-sm">ETA</Label>
-                <div className="flex items-center gap-2">
+                <div className="flex gap-2">
                   <Input
+                    type="text"
+                    readOnly
+                    placeholder="jj/mm/aaaa"
+                    className="bg-black/40 border-gray-700 text-white cursor-pointer"
+                    value={formatDateFr(form.eta ? String(form.eta).slice(0, 10) : "")}
+                    onClick={() => {
+                      const input = etaInputRef.current;
+                      if (!input) return;
+                      if (typeof (input as any).showPicker === "function") (input as any).showPicker();
+                      else input.click();
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="border-gray-700 bg-white text-black hover:bg-gray-200"
+                    onClick={() => {
+                      const input = etaInputRef.current;
+                      if (!input) return;
+                      if (typeof (input as any).showPicker === "function") (input as any).showPicker();
+                      else input.click();
+                    }}
+                    aria-label="Choisir une date ETA"
+                  >
+                    <CalendarDays className="h-4 w-4" />
+                  </Button>
+                  <input
+                    ref={etaInputRef}
                     type="date"
-                    className="bg-black/40 border-gray-700 text-white"
+                    className="sr-only"
                     value={form.eta ? String(form.eta).slice(0, 10) : ""}
                     onChange={(e) => setForm({ ...form, eta: e.target.value })}
+                    tabIndex={-1}
                   />
-                  <Button variant="outline" size="icon" title="Pick date">
-                    <CalendarIcon className="h-4 w-4" />
-                  </Button>
                 </div>
               </div>
 
-              {/* Héritage / infos techniques conservées */}
-              <div>
-                <Label className="text-sm">Type</Label>
-                <Input value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })} />
-              </div>
-              <div>
-                <Label className="text-sm">DWT</Label>
-                <Input value={form.dwt} onChange={(e) => setForm({ ...form, dwt: e.target.value })} />
-              </div>
-              <div>
-                <Label className="text-sm">Origin</Label>
-                <Input value={form.origin} onChange={(e) => setForm({ ...form, origin: e.target.value })} />
-              </div>
+
             </div>
 
             {/* Allocations par grade */}
@@ -488,112 +620,6 @@ export default function Navires() {
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-/** -----------------------------------------------------------------------
- * Very small calendar widget (original)
- * ----------------------------------------------------------------------*/
-function MiniCalendar({
-  value,
-  onSelect,
-  onDismiss,
-}: {
-  value: Date | null;
-  onSelect: (d: Date) => void;
-  onDismiss?: () => void;
-}) {
-  const [cursor, setCursor] = useState<Date>(() => {
-    const base = value ?? new Date();
-    return new Date(base.getFullYear(), base.getMonth(), 1);
-  });
-
-  const monthLabel = cursor.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-
-  // Build grid (start on Monday)
-  const startDay = (() => {
-    const day = cursor.getDay(); // 0 Sun .. 6 Sat
-    const diff = (day + 6) % 7; // 0 Mon .. 6 Sun
-    const d = new Date(cursor);
-    d.setDate(1 - diff);
-    d.setHours(0, 0, 0, 0);
-    return d;
-  })();
-
-  const days: Date[] = [];
-  for (let i = 0; i < 42; i++) {
-    const d = new Date(startDay);
-    d.setDate(startDay.getDate() + i);
-    days.push(d);
-  }
-
-  const isSameDay = (a: Date, b: Date) =>
-    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const selected = value ? new Date(value) : null;
-  if (selected) selected.setHours(0, 0, 0, 0);
-
-  return (
-    <div className="w-[280px] select-none">
-      <div className="flex items-center justify-between mb-2">
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1))}
-        >
-          <ChevronLeft className="h-4 w-4" />
-        </Button>
-        <div className="font-medium">{monthLabel}</div>
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1))}
-        >
-          <ChevronRight className="h-4 w-4" />
-        </Button>
-      </div>
-
-      <div className="grid grid-cols-7 text-center text-xs text-gray-400 mb-1">
-        <div>Mon</div>
-        <div>Tue</div>
-        <div>Wed</div>
-        <div>Thu</div>
-        <div>Fri</div>
-        <div>Sat</div>
-        <div>Sun</div>
-      </div>
-
-      <div className="grid grid-cols-7 gap-1">
-        {days.map((d, i) => {
-          const inMonth = d.getMonth() === cursor.getMonth();
-          const isToday = isSameDay(d, today);
-          const isSel = selected ? isSameDay(d, selected) : false;
-
-          const base = "py-1.5 rounded-md text-sm";
-          const tone = isSel
-            ? "bg-trading-blue text-white"
-            : isToday
-            ? "border border-trading-blue text-white"
-            : inMonth
-            ? "text-gray-100 hover:bg-gray-800"
-            : "text-gray-500 hover:bg-gray-800";
-
-          return (
-            <button key={i} className={`${base} ${tone}`} onClick={() => onSelect(d)}>
-              {d.getDate()}
-            </button>
-          );
-        })}
-      </div>
-
-      <div className="flex justify-end mt-3">
-        <Button variant="outline" size="sm" onClick={onDismiss}>
-          Close
-        </Button>
-      </div>
     </div>
   );
 }

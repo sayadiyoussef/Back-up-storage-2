@@ -11,6 +11,16 @@ import {
   // insertContractSchema,
 } from "../shared/schema.ts";
 
+function getErrorStatus(e: any, fallback = 400): number {
+  const status = Number(e?.status);
+  if (Number.isFinite(status) && status >= 400 && status < 600) return status;
+  return fallback;
+}
+
+function getErrorMessage(e: any, fallback: string): string {
+  return e?.message || fallback;
+}
+
 export async function registerRoutes(app: Express): Promise<Server> {
   /* ---------------- Auth ---------------- */
   app.post("/api/auth/login", async (req, res) => {
@@ -63,7 +73,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } as any);
       res.json({ data: created });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to create grade" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to create grade") });
     }
   });
 
@@ -77,7 +87,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const updated = await storage.updateOilGradeFreight(id, freightUsd);
       res.json({ data: updated });
     } catch (e: any) {
-      res.status(404).json({ message: e?.message || "Grade not found" });
+      res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Grade not found") });
     }
   });
 
@@ -113,7 +123,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       res.json({ data: updated });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to update grade" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to update grade") });
     }
   });
 
@@ -316,9 +326,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({ data: saved });
     } catch (e: any) {
       console.error("CREATE FIXING ERROR:", e);
-      const status = Number(e?.status) || 500;
-      res.status(status).json({
-        message: e?.message || "Failed to create fixing",
+      res.status(getErrorStatus(e, 500)).json({
+        message: getErrorMessage(e, "Failed to create fixing"),
       });
     }
   });
@@ -330,8 +339,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({ data: updated });
     } catch (e: any) {
       console.error("UPDATE FIXING ERROR:", e);
-      const status = Number(e?.status) || 500;
-      res.status(status).json({ message: e?.message || "Failed to update fixing" });
+      res.status(getErrorStatus(e, 500)).json({ message: getErrorMessage(e, "Failed to update fixing") });
     }
   });
 
@@ -342,7 +350,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({ data: { id } });
     } catch (e: any) {
       console.error("DELETE FIXING ERROR:", e);
-      res.status(404).json({ message: e?.message || "Fixing not found" });
+      res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Fixing not found") });
     }
   });
 
@@ -462,7 +470,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const saved = await storage.createVessel(payload);
         res.json({ data: saved });
       } catch (e: any) {
-        res.status(400).json({ message: e?.message || "Failed to create vessel" });
+        res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to create vessel") });
       }
     });
 
@@ -471,7 +479,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const updated = await storage.updateVessel(req.params.id, req.body || {});
         res.json({ data: updated });
       } catch (e: any) {
-        res.status(404).json({ message: e?.message || "Vessel not found" });
+        res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Vessel not found") });
       }
     });
 
@@ -479,8 +487,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       try {
         await storage.deleteVessel(req.params.id);
         res.json({ data: { id: req.params.id } });
-      } catch {
-        res.status(404).json({ message: "Vessel not found" });
+      } catch (e: any) {
+        res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Vessel not found") });
       }
     });
   }
@@ -581,7 +589,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const saved = await storage.createContract(payload as any);
         res.json({ data: saved });
       } catch (e: any) {
-        res.status(400).json({ message: e?.message || "Invalid contract payload" });
+        res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Invalid contract payload") });
       }
     });
 
@@ -598,7 +606,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const saved = await storage.updateContract(id, patch as any);
         res.json({ data: saved });
       } catch (e: any) {
-        res.status(400).json({ message: e?.message || "Failed to update contract" });
+        res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to update contract") });
       }
     });
 
@@ -607,8 +615,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const id = String(req.params.id);
         await storage.deleteContract(id);
         res.json({ data: { id } });
-      } catch {
-        res.status(404).json({ message: "Contract not found" });
+      } catch (e: any) {
+        res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Contract not found") });
       }
     });
   };
@@ -623,7 +631,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const rows = await storage.getContractRequirements(String(req.params.id));
       res.json({ data: rows });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to fetch contract requirements" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to fetch contract requirements") });
     }
   });
 
@@ -632,7 +640,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const rows = await storage.getContractAllocations(String(req.params.id));
       res.json({ data: rows });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to fetch contract allocations" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to fetch contract allocations") });
     }
   });
 
@@ -641,7 +649,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const coverage = await storage.getContractCoverage(String(req.params.id));
       res.json({ data: coverage });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to compute contract coverage" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to compute contract coverage") });
     }
   });
 
@@ -667,8 +675,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ data: saved });
     } catch (e: any) {
-      const status = Number(e?.status) || 400;
-      res.status(status).json({ message: e?.message || "Failed to allocate fixing" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to allocate fixing") });
     }
   });
 
@@ -678,7 +685,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       await storage.deleteAllocation(id);
       res.json({ data: { id } });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to delete allocation" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to delete allocation") });
     }
   });
 
@@ -687,7 +694,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const rows = await storage.getGradeAllocationSummary();
       res.json({ data: rows });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to fetch allocation summary" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to fetch allocation summary") });
     }
   });
 
@@ -696,7 +703,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const availableQty = await storage.getFixingAvailableQty(String(req.params.id));
       res.json({ data: { fixingId: String(req.params.id), availableQty } });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to fetch fixing availability" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to fetch fixing availability") });
     }
   });
 
@@ -706,7 +713,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const rows = await storage.getAllProducts();
       res.json({ data: rows });
     } catch (e: any) {
-      res.status(500).json({ message: e?.message || "Failed to fetch products" });
+      res.status(getErrorStatus(e, 500)).json({ message: getErrorMessage(e, "Failed to fetch products") });
     }
   });
 
@@ -720,7 +727,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
       res.json({ data: created });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to create product" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to create product") });
     }
   });
 
@@ -732,7 +739,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       );
       res.json({ data: updated });
     } catch (e: any) {
-      res.status(404).json({ message: e?.message || "Product not found" });
+      res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Product not found") });
     }
   });
 
@@ -742,9 +749,34 @@ export async function registerRoutes(app: Express): Promise<Server> {
       await storage.deleteProduct(id);
       res.json({ data: { id } });
     } catch (e: any) {
-      res.status(404).json({ message: e?.message || "Product not found" });
+      res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Product not found") });
     }
   });
+
+
+
+  /* ===== TARGET MARGINS / MARGES CIBLES ===== */
+  app.get("/api/target-margins", async (_req, res) => {
+    try { const rows = await (storage as any).getAllTargetMargins(); res.json({ data: rows }); }
+    catch (e: any) { res.status(getErrorStatus(e, 500)).json({ message: getErrorMessage(e, "Failed to fetch target margins") }); }
+  });
+  app.post("/api/target-margins", async (req, res) => {
+    try { const b = req.body || {}; const saved = await (storage as any).createTargetMargin({ market: b.market === "EXPORT" ? "EXPORT" : "LOCAL", clientId: b.clientId || undefined, clientName: String(b.clientName || "").trim(), productId: b.productId || undefined, productName: String(b.productName || "").trim(), marginTnd: b.marginTnd === "" || b.marginTnd == null ? undefined : Number(b.marginTnd), marginUsd: b.marginUsd === "" || b.marginUsd == null ? undefined : Number(b.marginUsd) }); res.json({ data: saved }); }
+    catch (e: any) { res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to create target margin") }); }
+  });
+  app.put("/api/target-margins/:id", async (req, res) => {
+    try { const b = req.body || {}; const saved = await (storage as any).updateTargetMargin(String(req.params.id), { market: b.market === "EXPORT" ? "EXPORT" : "LOCAL", clientId: b.clientId || undefined, clientName: String(b.clientName || "").trim(), productId: b.productId || undefined, productName: String(b.productName || "").trim(), marginTnd: b.marginTnd === "" || b.marginTnd == null ? undefined : Number(b.marginTnd), marginUsd: b.marginUsd === "" || b.marginUsd == null ? undefined : Number(b.marginUsd) }); res.json({ data: saved }); }
+    catch (e: any) { res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to update target margin") }); }
+  });
+  app.delete("/api/target-margins/:id", async (req, res) => {
+    try { const id = String(req.params.id); await (storage as any).deleteTargetMargin(id); res.json({ data: { id } }); }
+    catch (e: any) { res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Target margin not found") }); }
+  });
+  app.post("/api/target-margins/import", async (req, res) => {
+    try { const rows = Array.isArray(req.body?.rows) ? req.body.rows : []; if (!rows.length) return res.status(400).json({ message: "Aucune ligne à importer." }); const saved = await (storage as any).replaceTargetMargins(rows.map((r: any) => ({ market: r.market === "EXPORT" ? "EXPORT" : "LOCAL", clientId: r.clientId || undefined, clientName: String(r.clientName || r.client || "").trim(), productId: r.productId || undefined, productName: String(r.productName || r.product || "").trim(), marginTnd: r.marginTnd === "" || r.marginTnd == null ? undefined : Number(r.marginTnd), marginUsd: r.marginUsd === "" || r.marginUsd == null ? undefined : Number(r.marginUsd) }))); res.json({ data: saved }); }
+    catch (e: any) { res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to import target margins") }); }
+  });
+
 
   /* ===== CLIENTS ===== */
   app.get("/api/clients", async (_req, res) => {
@@ -752,7 +784,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const rows = await storage.getAllClients();
       res.json({ data: rows });
     } catch (e: any) {
-      res.status(500).json({ message: e?.message || "Failed to fetch clients" });
+      res.status(getErrorStatus(e, 500)).json({ message: getErrorMessage(e, "Failed to fetch clients") });
     }
   });
 
@@ -766,7 +798,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } as any);
       res.json({ data: created });
     } catch (e: any) {
-      res.status(400).json({ message: e?.message || "Failed to create client" });
+      res.status(getErrorStatus(e, 400)).json({ message: getErrorMessage(e, "Failed to create client") });
     }
   });
 
@@ -778,7 +810,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       );
       res.json({ data: updated });
     } catch (e: any) {
-      res.status(404).json({ message: e?.message || "Client not found" });
+      res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Client not found") });
     }
   });
 
@@ -788,7 +820,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       await storage.deleteClient(id);
       res.json({ data: { id } });
     } catch (e: any) {
-      res.status(404).json({ message: e?.message || "Client not found" });
+      res.status(getErrorStatus(e, 404)).json({ message: getErrorMessage(e, "Client not found") });
     }
   });
 

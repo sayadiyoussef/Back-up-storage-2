@@ -62,6 +62,14 @@ const fetchJSON = async (url: string, init?: RequestInit) => {
   return payload;
 };
 
+const cleanApiError = (e: any): string => {
+  const raw = String(e?.message || e || "Erreur inconnue").trim();
+
+  // fetchJSON remonte souvent: "409 Message" ou "404 Message".
+  // On enlève uniquement le préfixe HTTP pour afficher le message métier clairement.
+  return raw.replace(/^\d{3}\s+/, "");
+};
+
 const toNum = (v: unknown): number => {
   const n = typeof v === "string" ? parseFloat(v) : (v as number);
   return Number.isFinite(n) ? Number(n) : 0;
@@ -246,6 +254,9 @@ export default function FixingsPage() {
       });
 
       qc.invalidateQueries({ queryKey: ["/api/fixings"] });
+      qc.invalidateQueries({ queryKey: ["/api/vessels"] });
+      qc.invalidateQueries({ queryKey: ["/api/contracts"] });
+      qc.invalidateQueries({ queryKey: ["/api/allocation-summary/grades"] });
 
       setOpen(false);
       setEditingId(null);
@@ -253,7 +264,7 @@ export default function FixingsPage() {
     },
     onError: (e: any) => {
       console.error("SAVE FIXING ERROR:", e);
-      alert(`Erreur lors de l'enregistrement:\n${e?.message || e}`);
+      alert(`Erreur lors de l'enregistrement:\n${cleanApiError(e)}`);
     },
   });
 
@@ -268,6 +279,9 @@ export default function FixingsPage() {
       });
 
       qc.invalidateQueries({ queryKey: ["/api/fixings"] });
+      qc.invalidateQueries({ queryKey: ["/api/vessels"] });
+      qc.invalidateQueries({ queryKey: ["/api/contracts"] });
+      qc.invalidateQueries({ queryKey: ["/api/allocation-summary/grades"] });
 
       if (viewOpen && viewFixing?.id === id) {
         setViewOpen(false);
@@ -277,7 +291,7 @@ export default function FixingsPage() {
 
     onError: (e: any) => {
       console.error("DELETE FIXING ERROR:", e);
-      alert(`Erreur lors de la suppression:\n${e?.message || e}`);
+      alert(`Erreur lors de la suppression:\n${cleanApiError(e)}`);
     },
   });
 
@@ -561,7 +575,7 @@ export default function FixingsPage() {
                                       disabled={delFixing.isPending}
                                       onClick={() => {
                                         if (!r.id) return;
-                                        if (confirm("Supprimer ce fixing ?")) {
+                                        if (confirm("Supprimer ce fixing ?\n\nSi ce fixing est déjà affecté à un contrat, la suppression sera bloquée.")) {
                                           delFixing.mutate(r.id);
                                         }
                                       }}
@@ -795,7 +809,7 @@ export default function FixingsPage() {
                   variant="destructive"
                   disabled={delFixing.isPending}
                   onClick={() => {
-                    if (confirm("Supprimer ce fixing ?")) {
+                    if (confirm("Supprimer ce fixing ?\n\nSi ce fixing est déjà affecté à un contrat, la suppression sera bloquée.")) {
                       delFixing.mutate(viewFixing.id!);
                     }
                   }}
